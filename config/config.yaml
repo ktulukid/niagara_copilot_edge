@@ -1,0 +1,14 @@
+site_name: AMS_Office
+
+data_source:
+  type: csv
+  directory: "./data"
+
+comfort:
+  occupied_start: "07:00"
+  occupied_end: "18:00"
+  setpoint_column: zn_sp
+  temp_column: zn_t
+  equip_column: equip
+  timestamp_column: timestamp
+  comfort_band_degF: 2.0
