@@ -4,3 +4,4 @@ pydantic
 pyyaml
 pandas
 requests
+paho-mqtt
