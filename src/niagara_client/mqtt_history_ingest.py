@@ -1,13 +1,13 @@
 # src/niagara_client/mqtt_history_ingest.py
 
-from __future__ import annotations
-
+import re
 import json
+import paho.mqtt.client as mqtt
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, List, Optional
+from __future__ import annotations
 
-import paho.mqtt.client as mqtt
 
 
 @dataclass
@@ -21,6 +21,47 @@ class HistorySample:
 
 # Type of callback your app will provide
 BatchHandler = Callable[[List[HistorySample]], None]
+
+def niagara_decode_name(name: str) -> str:
+    """
+    Decode Niagara-style hex escapes into a human label.
+
+    Examples:
+      "Zone$2d1$20Space$20Temp" -> "Zone-1 Space Temp"
+    """
+    if not name:
+        return name
+
+    s = name
+    s = s.replace("$20", " ")
+    s = s.replace("$2d", "-")
+    # You can extend for other codes later, e.g. "$2e" -> ".", etc.
+    return s
+
+
+def niagara_canonical_name(name: str) -> str:
+    """
+    Turn a decoded Niagara label into a machine-safe, snake_case key.
+
+    Examples:
+      "Zone-1 Space Temp" -> "zone_1_space_temp"
+    """
+    if not name:
+        return name
+
+    # First ensure it's decoded (idempotent if already decoded)
+    decoded = niagara_decode_name(name)
+
+    # Lowercase
+    s = decoded.lower()
+
+    # Replace any sequence of non-alphanumeric characters with "_"
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+
+    # Trim leading/trailing underscores
+    s = s.strip("_")
+
+    return s
 
 
 def _parse_timestamp(ts: str) -> datetime:
@@ -89,8 +130,10 @@ def make_history_mqtt_client(
                 # ignore other message types for now
                 return
 
-            station_name = data["stationName"]
-            history_id = data["historyId"]
+            raw_station = payload.get("stationName", "")
+            raw_history = payload.get("historyId", "")
+            station_name = niagara_canonical_name(raw_station)
+            history_id = niagara_canonical_name(raw_history)
             rows = data.get("historyData", [])
 
             samples: List[HistorySample] = []
