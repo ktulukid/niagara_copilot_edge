@@ -1,18 +1,15 @@
+import pandas as pd
+import os
+
 from datetime import datetime, timedelta
-
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
-
+from typing import List
 from ..config import load_config
 from ..niagara_client.factory import make_history_client
 from ..analytics.comfort import compute_zone_comfort
-
-import os
-from typing import List
-from ..niagara_client.mqtt_history_ingest import (
-    make_history_mqtt_client,
-    HistorySample,
-)
+from ..niagara_client.mqtt_history_ingest import make_history_mqtt_client, HistorySample
+from ..store.history_store import add_batch, get_recent
 
 
 app = FastAPI(title="Niagara Copilot Edge")
@@ -28,20 +25,24 @@ mqtt_client = None  # will hold the paho client instance
 
 def handle_history_batch(samples: List[HistorySample]) -> None:
     """
-    This is where you integrate MQTT history into your storage layer.
+    Called for each MQTT history JSON message.
 
-    For now it just logs; you can later:
-      - write to SQLite/Postgres
-      - append to parquet
-      - keep an in-memory cache keyed by (station_name, history_id)
+    - Stores samples in the in-memory history store.
+    - Logs a summary line.
     """
     if not samples:
         return
+
+    # Store in memory
+    add_batch(samples)
+
+    # Log summary
     first = samples[0]
     print(
         f"[mqtt] got {len(samples)} samples for "
         f"{first.station_name} {first.history_id}"
     )
+
 
 
 class ComfortResponse(BaseModel):
@@ -101,3 +102,102 @@ def start_mqtt_ingestion() -> None:
     except Exception as e:
         print(f"[warn] MQTT ingestion disabled (could not connect to {host}:{port}): {e}")
         mqtt_client = None
+
+@app.get("/debug/histories")
+def debug_get_histories(
+    stationName: str | None = Query(None, description="Filter by stationName"),
+    historyId: str | None = Query(None, description="Filter by historyId"),
+    limit: int = Query(100, ge=1, le=1000, description="Max samples to return"),
+):
+    """
+    Debug endpoint to inspect recent history samples received via MQTT.
+
+    Example:
+      /debug/histories?stationName=AmsShop&historyId=/AmsShop/MaxSpaceTemp&limit=50
+    """
+    items = get_recent(
+        station=stationName,
+        history_id=historyId,
+        limit=limit,
+    )
+
+    if not items:
+        # Not an error, but useful feedback while debugging
+        return {
+            "stationName": stationName,
+            "historyId": historyId,
+            "limit": limit,
+            "count": 0,
+            "samples": [],
+        }
+
+    # Infer station/history from the first item if not provided
+    station = stationName or items[0]["station_name"]
+    hist_id = historyId or items[0]["history_id"]
+
+    return {
+        "stationName": station,
+        "historyId": hist_id,
+        "limit": limit,
+        "count": len(items),
+        "samples": items,
+    }
+@app.get("/debug/comfort")
+def debug_zone_comfort(
+    stationName: str = Query(..., description="Niagara stationName, e.g. AmsShop"),
+    historyId: str = Query(..., description="History ID, e.g. /AmsShop/MaxSpaceTemp"),
+    limit: int = Query(288, ge=10, le=2000, description="Max samples to use"),
+    setpoint: float = Query(75.0, description="Temporary constant setpoint in °F"),
+):
+    """
+    Compute a simple comfort score for a single history series using
+    the in-memory MQTT history store.
+
+    For now this assumes:
+      - `value` from MQTT = zone temperature
+      - A constant setpoint (query param) for all samples
+    """
+    samples = get_recent(
+        station=stationName,
+        history_id=historyId,
+        limit=limit,
+    )
+
+    if not samples:
+        return {
+            "stationName": stationName,
+            "historyId": historyId,
+            "limit": limit,
+            "setpoint_used_degF": setpoint,
+            "analytics": {
+                "samples": 0,
+                "within_band_pct": None,
+                "mean_error_degF": None,
+            },
+        }
+
+    c = _config.comfort
+
+    ts_col = c.timestamp_column
+    t_col = c.temp_column
+    sp_col = c.setpoint_column
+    equip_col = c.equip_column
+
+    # Build a DataFrame with the columns the comfort code expects
+    df = pd.DataFrame(samples)
+
+    # Map MQTT fields → configured columns
+    df[ts_col] = pd.to_datetime(df["timestamp"])
+    df[t_col] = df["value"]
+    df[sp_col] = float(setpoint)
+    df[equip_col] = historyId  # dummy equip label for now
+
+    result = compute_zone_comfort(df, c)
+
+    return {
+        "stationName": stationName,
+        "historyId": historyId,
+        "limit": limit,
+        "setpoint_used_degF": setpoint,
+        "analytics": result,
+    }
