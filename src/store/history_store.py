@@ -5,8 +5,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from ..niagara_client.mqtt_history_ingest import HistorySample
-from ..niagara_client.mqtt_history_ingest import niagara_canonical_name
+from ..niagara_client.mqtt_history_ingest import HistorySample, niagara_canonical_name
 
 # Max samples to keep per (station, history_id)
 _MAX_PER_SERIES = 1000
@@ -15,17 +14,22 @@ _MAX_PER_SERIES = 1000
 _store: Dict[Tuple[str, str], Dict[datetime, HistorySample]] = defaultdict(dict)
 
 
-def add_batch(samples: List[HistorySample]) -> None:
-    """
-    Add a batch of HistorySample objects into the in-memory store.
+def clear() -> None:
+    """Clear all stored history samples (mainly for tests)."""
+    _store.clear()
 
-    - For each (station, history_id, timestamp), only the last value is kept.
-    - Oldest timestamps are dropped when we exceed _MAX_PER_SERIES per series.
+
+def add_batch(samples: List[HistorySample]) -> None:
+    """Add a batch of HistorySample objects into the in-memory store.
+
+    For each (station, history_id, timestamp) we only keep the most recent
+    value. Oldest timestamps are dropped once we exceed ``_MAX_PER_SERIES``
+    per series.
     """
     if not samples:
         return
 
-    # Track which series we touched so we can trim them once per batch
+    # Track which series we touched so we can trim them once per batch.
     touched: set[Tuple[str, str]] = set()
 
     for s in samples:
@@ -36,12 +40,12 @@ def add_batch(samples: List[HistorySample]) -> None:
         series = _store[key]
         series[s.timestamp] = s
         touched.add(key)
-        
-    # Enforce per-series cap
+
+    # Enforce per-series cap.
     for key in touched:
         series = _store[key]
         if len(series) > _MAX_PER_SERIES:
-            # sort timestamps ascending and drop the oldest
+            # Sort timestamps ascending and drop the oldest ones.
             timestamps = sorted(series.keys())
             to_drop = timestamps[:-_MAX_PER_SERIES]
             for ts in to_drop:
@@ -49,11 +53,9 @@ def add_batch(samples: List[HistorySample]) -> None:
 
 
 def _sample_to_json(sample: HistorySample) -> dict:
-    """
-    Convert a HistorySample into a JSON-serializable dict.
-    """
+    """Convert a HistorySample to a JSON-serialisable dict."""
     d = asdict(sample)
-    ts = d["timestamp"]
+    ts = d.get("timestamp")
     if isinstance(ts, datetime):
         d["timestamp"] = ts.isoformat()
     else:
@@ -62,23 +64,34 @@ def _sample_to_json(sample: HistorySample) -> dict:
 
 
 def get_recent(
+    *,
     station: Optional[str] = None,
     history_id: Optional[str] = None,
     limit: int = 100,
 ) -> List[dict]:
-    """
-    Get up to `limit` most recent samples, optionally filtered
-    by station and/or history_id.
+    """Return up to ``limit`` most recent samples.
 
-    Returns a list of JSON-serializable dicts sorted by timestamp ascending.
+    Filters:
+      - ``station``: optional station name to filter on.
+      - ``history_id``: optional history id to filter on.
+
+    Returned list is sorted by timestamp ascending and already JSON-ready.
     """
     results: List[HistorySample] = []
 
+    # Canonicalise filters once up front.
+    station_key: Optional[str] = (
+        niagara_canonical_name(station) if station is not None else None
+    )
+    history_key: Optional[str] = (
+        niagara_canonical_name(history_id) if history_id is not None else None
+    )
+
     for (st_name, hist_id), series in _store.items():
-        if station is not None:
-            station = niagara_canonical_name(station)
-        if history_id is not None:
-            history_id = niagara_canonical_name(history_id)
+        if station_key is not None and st_name != station_key:
+            continue
+        if history_key is not None and hist_id != history_key:
+            continue
 
         timestamps = sorted(series.keys())
         if limit <= 0:

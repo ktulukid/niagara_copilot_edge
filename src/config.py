@@ -1,11 +1,14 @@
-from pathlib import Path
-from typing import Optional, Literal
+from __future__ import annotations
 
-from pydantic import BaseModel
+from pathlib import Path
+from typing import Literal, Optional
+
 import yaml
+from pydantic import BaseModel
 
 
 DataSourceType = Literal["niagara_csv_export", "mqtt_json_stream"]
+
 
 class MqttConfig(BaseModel):
     host: str = "localhost"
@@ -14,8 +17,8 @@ class MqttConfig(BaseModel):
 
 
 class NiagaraCsvExportConfig(BaseModel):
-    host: str                    # "172.20.40.22"
-    ord_path: str                # "file:%5EhistoryExports/AmsShop"
+    host: str                    # e.g. "172.20.40.22"
+    ord_path: str                # e.g. "file:%5EhistoryExports/AmsShop"
     username: str
     password_env: str = "NIAGARA_PASSWORD"
     insecure_tls: bool = True
@@ -44,8 +47,8 @@ class ComfortConfig(BaseModel):
     occupied_end: str            # "18:00"
     setpoint_column: str
     temp_column: str
-    equip_column: str
     timestamp_column: str
+    equip_column: str
     comfort_band_degF: float
 
 
@@ -55,9 +58,43 @@ class AppConfig(BaseModel):
     comfort: ComfortConfig
     mqtt: MqttConfig = MqttConfig()
 
+    # Local SQLite history store path and retention
+    db_path: str = "data/history.sqlite"
+    db_retention_hours: int = 24 * 30  # 30 days default
+
 
 def load_config(path: Path | str = "config/config.yaml") -> AppConfig:
+    """
+    Load YAML config, then interactively prompt for MQTT host/port overrides.
+
+    If stdin is not available (e.g. non-interactive run), it will silently
+    skip prompts and just use values from config.yaml / defaults.
+    """
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    return AppConfig.parse_obj(raw)
+        raw = yaml.safe_load(f) or {}
+
+    cfg = AppConfig.parse_obj(raw)
+
+    # Interactive override of MQTT host/port
+    try:
+        default_host = cfg.mqtt.host
+        default_port = cfg.mqtt.port
+
+        host_in = input(f"Enter MQTT broker address [{default_host}]: ").strip()
+        port_in = input(f"Enter MQTT broker port [{default_port}]: ").strip()
+
+        if host_in:
+            cfg.mqtt.host = host_in
+
+        if port_in:
+            try:
+                cfg.mqtt.port = int(port_in)
+            except ValueError:
+                print(f"Invalid port '{port_in}', keeping {default_port}")
+
+    except EOFError:
+        # Non-interactive environment: just keep YAML/default values
+        pass
+
+    return cfg
