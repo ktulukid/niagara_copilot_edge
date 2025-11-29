@@ -7,7 +7,15 @@ import yaml
 from pydantic import BaseModel
 
 
-DataSourceType = Literal["niagara_csv_export", "mqtt_json_stream"]
+# -----------------------------
+# Data Source Types
+# -----------------------------
+
+DataSourceType = Literal[
+    "niagara_csv_export",
+    "mqtt_json_stream",
+    "haystack"            # NEW
+]
 
 
 class MqttConfig(BaseModel):
@@ -36,11 +44,33 @@ class MqttJsonStreamConfig(BaseModel):
     retention_hours: int = 24
 
 
+# -----------------------------
+# NEW: Haystack Config
+# -----------------------------
+
+class HaystackConfig(BaseModel):
+    uri: str                        # e.g. "http://172.20.40.22/haystack/"
+    username: str                    # Niagara/NHaystack username
+    password_env: str = "NIAGARA_PASSWORD"
+    project: str = "default"         # optional
+
+
+# -----------------------------
+# Unified Data Source Loader
+# -----------------------------
+
 class DataSourceConfig(BaseModel):
     type: DataSourceType
     niagara_csv_export: Optional[NiagaraCsvExportConfig] = None
     mqtt_json_stream: Optional[MqttJsonStreamConfig] = None
 
+    # NEW
+    haystack: Optional[HaystackConfig] = None
+
+
+# -----------------------------
+# Comfort Analytics Config
+# -----------------------------
 
 class ComfortConfig(BaseModel):
     occupied_start: str          # "07:00"
@@ -52,6 +82,10 @@ class ComfortConfig(BaseModel):
     comfort_band_degF: float
 
 
+# -----------------------------
+# Main Application Config
+# -----------------------------
+
 class AppConfig(BaseModel):
     site_name: str
     data_source: DataSourceConfig
@@ -62,6 +96,13 @@ class AppConfig(BaseModel):
     db_path: str = "data/history.sqlite"
     db_retention_hours: int = 24 * 30  # 30 days default
 
+    # NEW: global Haystack defaults at root level (optional)
+    haystack: Optional[HaystackConfig] = None
+
+
+# -----------------------------
+# Config Loader
+# -----------------------------
 
 def load_config(path: Path | str = "config/config.yaml") -> AppConfig:
     """
@@ -94,7 +135,7 @@ def load_config(path: Path | str = "config/config.yaml") -> AppConfig:
                 print(f"Invalid port '{port_in}', keeping {default_port}")
 
     except EOFError:
-        # Non-interactive environment: just keep YAML/default values
+        # Non-interactive environment: keep YAML/default values
         pass
 
     return cfg

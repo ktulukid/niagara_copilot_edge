@@ -1,26 +1,26 @@
-site_name: AMS_Office
+site_name: "Ams Shop"
 
 data_source:
-  type: "mqtt_json_stream"
-  mqtt_json_stream:
-    host: "172.20.0.6" # or wherever Mosquitto lives
-    port: 1883
-    topic: "niagara/histories"
-    username: null # unless you configured auth
-    password_env: "MQTT_PASSWORD"
-    tls: false # true later if you enable SSL
-    retention_hours: 48
+  type: "haystack"
+  haystack:
+    uri: "http://172.20.40.22"
+    username: "AMS"
+    password_env: "NIAGARA_PASSWORD"
+    project: "default"
 
 comfort:
   occupied_start: "07:00"
   occupied_end: "18:00"
   setpoint_column: "zn_sp"
   temp_column: "zn_t"
-  equip_column: "equip"
   timestamp_column: "timestamp"
+  equip_column: "zone_root"
   comfort_band_degF: 2.0
 
 mqtt:
-  host: localhost
+  host: "localhost"
   port: 1883
-  history_topic: niagara/histories
+  history_topic: "niagara/histories"
+
+db_path: "data/history.sqlite"
+db_retention_hours: 720

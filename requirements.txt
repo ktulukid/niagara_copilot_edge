@@ -5,3 +5,4 @@ pyyaml
 pandas
 requests
 paho-mqtt
+pyhaystack>=0.92

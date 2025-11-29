@@ -1,506 +1,532 @@
-# src/api/server.py
-
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
+import os
+import traceback
 
-import pandas as pd
-from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from ..config import load_config, AppConfig
-from ..niagara_client.factory import make_history_client
+from ..config import AppConfig, ComfortConfig, load_config
+from ..analytics.zone_pairs import zone_pairs_as_dicts, find_zone_pair
+from ..analytics.zone_health import compute_zone_health, zone_health_to_dict
+from ..analytics.flow import compute_flow_tracking, FlowTrackingConfig
 from ..analytics.comfort import compute_zone_comfort
 from ..niagara_client.mqtt_history_ingest import (
-    make_history_mqtt_client,
     HistorySample,
-    niagara_canonical_name,
+    make_history_mqtt_client,
 )
-from ..store.history_store import add_batch as mem_add_batch, get_recent as mem_get_recent
-from ..store import sqlite_store
-from ..analytics.zone_pairs import zone_pairs_as_dicts, find_zone_pair
-from ..analytics.flow import compute_flow_tracking, FlowTrackingConfig
-from ..analytics.zone_health import compute_zone_health, zone_health_to_dict
+from ..store import history_store, sqlite_store
+from ..niagara_client.haystack_client import (
+    HaystackHistoryClient,
+    HaystackConfig as HSClientConfig,
+)
 
-
-# -----------------------------------------------------------------------------
-# App + global init
-# -----------------------------------------------------------------------------
 
 app = FastAPI(title="Niagara Copilot Edge")
-router = APIRouter()
+
+# ---- Global initialization -------------------------------------------------
 
 _config: AppConfig = load_config()
 
-# Optional HTTP/CSV/oBIX history client (currently None for MQTT-only mode)
+# Initialize SQLite history store
+sqlite_store.init(_config.db_path, _config.db_retention_hours)
+
+# MQTT history ingestion → history_store + sqlite_store
 try:
-    _history_client = make_history_client(_config)
-except Exception as exc:  # pragma: no cover
-    print(f"[warn] history client init failed: {exc}")
-    _history_client = None
 
-# Initialise SQLite history store
-try:
-    sqlite_store.init(_config.db_path, _config.db_retention_hours)
-    print(
-        f"[sqlite] history store initialised at {_config.db_path} "
-        f"(retention={_config.db_retention_hours} hours)"
-    )
-except Exception as exc:  # pragma: no cover
-    print(f"[warn] sqlite_store.init failed: {exc}")
-
-
-def _on_history_batch(samples: List[HistorySample]) -> None:
-    """
-    Callback for Niagara history MQTT client.
-
-    Writes to both the in-memory history_store and the SQLite-backed store.
-    """
-    if not samples:
-        return
-
-    # In-memory store (for quick inspection / debugging)
-    mem_add_batch(samples)
-
-    # SQLite store (for durable analytics)
-    sqlite_store.add_batch(samples)
-
-
-# Start MQTT client for Niagara history ingestion
-try:
-    mqtt_host = os.getenv("MQTT_HOST", _config.mqtt.host)
-    mqtt_port = int(os.getenv("MQTT_PORT", str(_config.mqtt.port)))
-    history_topic = _config.mqtt.history_topic
+    def _on_history_batch(samples: List[HistorySample]) -> None:
+        # In-memory store (debug)
+        history_store.add_batch(samples)
+        # Durable store
+        sqlite_store.add_batch(samples)
 
     _mqtt_client = make_history_mqtt_client(
-        broker_host=mqtt_host,
-        broker_port=mqtt_port,
-        topic=history_topic,
+        mqtt_config=_config.mqtt,
         on_batch=_on_history_batch,
     )
-    _mqtt_client.loop_start()
-    print(f"[mqtt] Niagara history MQTT client started on {mqtt_host}:{mqtt_port} topic={history_topic}")
-except Exception as exc:  # pragma: no cover
-    print(f"[warn] failed to start Niagara history MQTT client: {exc}")
+except Exception as e:  # noqa: BLE001
+    # We don't crash the API if MQTT fails; just log and continue.
+    print(f"[warn] MQTT history client init failed: {e}")  # noqa: T201
+    _mqtt_client = None
+
+# Haystack client (optional, only if config is present)
+_haystack_client: Optional[HaystackHistoryClient] = None
+try:
+    hs_cfg = None
+    # Prefer top-level haystack config if present
+    if getattr(_config, "haystack", None) is not None:
+        hs_cfg = _config.haystack
+    # Fallback to data_source.haystack if defined there
+    elif getattr(_config.data_source, "haystack", None) is not None:
+        hs_cfg = _config.data_source.haystack
+
+    if hs_cfg is not None:
+        password = os.getenv(hs_cfg.password_env, "")
+        if not password:
+            print(
+                f"[warn] Haystack password env '{hs_cfg.password_env}' is empty or not set"
+            )
+        _haystack_client = HaystackHistoryClient(
+            HSClientConfig(
+                uri=hs_cfg.uri,
+                username=hs_cfg.username,
+                password=password,
+                proj=hs_cfg.project,
+            )
+        )
+        print("[info] Haystack client initialised")
+    else:
+        print("[info] No Haystack config found; Haystack client disabled")
+except Exception as e:  # noqa: BLE001
+    print(f"[warn] Haystack client init failed: {e}")  # noqa: T201
+    _haystack_client = None
 
 
-# -----------------------------------------------------------------------------
-# Pydantic models
-# -----------------------------------------------------------------------------
+# ---- Pydantic models -------------------------------------------------------
+
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    site_name: str
 
 
 class HistorySampleJson(BaseModel):
     stationName: str
     historyId: str
-    timestamp: str
+    timestamp: datetime
     status: Optional[str] = None
     value: float
 
 
-class ComfortMetrics(BaseModel):
+class ComfortMetricsModel(BaseModel):
     samples: int
     within_band_pct: Optional[float] = None
     mean_error_degF: Optional[float] = None
 
 
 class ComfortZonePairResponse(BaseModel):
+    station: str
     history_temp_id: str
     history_sp_id: str
-    metrics: ComfortMetrics
+    start: datetime
+    end: datetime
+    metrics: ComfortMetricsModel
 
 
-class ZonePairResponse(BaseModel):
-    station_key: str
-    station_name: str
-    zone_root: str
-    space_temp: str | None = None
-    space_temp_sp: str | None = None
-    flow: str | None = None
-    flow_sp: str | None = None
-    damper: str | None = None
-    reheat: str | None = None
-    fan_cmd: str | None = None
-    fan_status: str | None = None
+class FlowTrackingMetricsModel(BaseModel):
+    samples: int
+    within_band_pct: Optional[float] = None
+    mean_error_cfm: Optional[float] = None
+    mean_error_pct: Optional[float] = None
 
 
 class FlowTrackingResponse(BaseModel):
     station: str
     zone: str
-    flow_history_id: str | None
-    flow_sp_history_id: str | None
-    start: datetime | None
-    end: datetime | None
-    metrics: Dict[str, Any]
+    history_flow_id: Optional[str]
+    history_flow_sp_id: Optional[str]
+    start: datetime
+    end: datetime
+    metrics: FlowTrackingMetricsModel
+
+
+class ZonePairResponse(BaseModel):
+    station: str
+    zone_root: str
+    space_temp: Optional[str] = None
+    space_temp_sp: Optional[str] = None
+    flow: Optional[str] = None
+    flow_sp: Optional[str] = None
+    damper: Optional[str] = None
+    reheat: Optional[str] = None
+    fan_cmd: Optional[str] = None
+    fan_status: Optional[str] = None
 
 
 class ZoneHealthMetricsModel(BaseModel):
+    # Identity
     station: str
     zone_root: str
-    space_temp: str | None
-    space_temp_sp: str | None
-    flow: str | None
-    flow_sp: str | None
-    damper: str | None
-    reheat: str | None
-    fan_cmd: str | None
-    fan_status: str | None
 
+    space_temp: Optional[str] = None
+    space_temp_sp: Optional[str] = None
+    flow: Optional[str] = None
+    flow_sp: Optional[str] = None
+    damper: Optional[str] = None
+    reheat: Optional[str] = None
+    fan_cmd: Optional[str] = None
+    fan_status: Optional[str] = None
+
+    # Comfort
     comfort_samples: int
-    comfort_within_band_pct: float | None
-    comfort_mean_error_degF: float | None
+    comfort_within_band_pct: Optional[float] = None
+    comfort_mean_error_degF: Optional[float] = None
 
+    # Flow
     flow_samples: int
-    flow_within_band_pct: float | None
+    flow_within_band_pct: Optional[float] = None
+    mean_flow_error_cfm: Optional[float] = None
+    mean_flow_error_pct: Optional[float] = None
 
-    damper_high_open_low_flow_pct: float | None
-    damper_closed_high_flow_pct: float | None
+    # Damper
+    damper_high_open_low_flow_pct: Optional[float] = None
+    damper_closed_high_flow_pct: Optional[float] = None
 
-    reheat_waste_pct: float | None
-    overall_score: float | None
+    # Reheat
+    reheat_waste_pct: Optional[float] = None
+
+    # Fan
+    fan_disagree_pct: Optional[float] = None
+    fan_off_when_should_be_on_pct: Optional[float] = None
+    fan_short_cycle_count: Optional[int] = None
+
+    # Overall
+    overall_score: Optional[float] = None
+
+    # NEW: diagnostic status
+    status: str
+    reasons: List[str]
 
 
-# -----------------------------------------------------------------------------
-# Helper functions
-# -----------------------------------------------------------------------------
+# ---- Utility helpers -------------------------------------------------------
 
-def _rows_to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+
+def _rows_to_dataframe(rows: List[Dict[str, Any]]) -> Any:
+    import pandas as pd
+
     if not rows:
-        return pd.DataFrame(columns=["timestamp", "value"])
+        import pandas as _pd  # noqa: N812
+        return _pd.DataFrame()
     df = pd.DataFrame(rows)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    if "ts" in df.columns:
+        ts = pd.to_datetime(df["ts"], utc=True, format="mixed", errors="coerce")
+        df["timestamp"] = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+        df = df.dropna(subset=["timestamp"])
+        df = df.sort_values("timestamp")
     return df
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+def _normalize_for_json(obj: Any) -> Any:
+    """
+    Recursively normalize Haystack / hszinc types to plain Python types that
+    FastAPI / Pydantic can serialize.
 
-@router.get("/health", response_model=HealthResponse)
-def health_check() -> HealthResponse:
-    return HealthResponse()
+    - Basic types (str, int, float, bool, None) are returned as-is.
+    - dict -> normalize values.
+    - list/tuple -> normalize each element.
+    - everything else -> str(obj).
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _normalize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_for_json(v) for v in obj]
+    # Fallback for MarkerType, Ref, Quantity, etc.
+    return str(obj)
 
 
-@router.get("/debug/recent_memory", response_model=List[HistorySampleJson])
+# ---- Basic health ----------------------------------------------------------
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok", site_name=_config.site_name)
+
+
+# ---- Debug endpoints -------------------------------------------------------
+
+
+@app.get("/debug/recent_memory", response_model=List[HistorySampleJson])
 def debug_recent_memory(
-    station: Optional[str] = Query(None),
-    history_id: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=10_000),
+    station: str = Query(..., description="Station name"),
+    history_id: str = Query(..., description="History ID"),
+    limit: int = Query(50, ge=1, le=1000),
 ) -> List[HistorySampleJson]:
-    """
-    Inspect the most recent samples in the in-memory history_store.
-    """
-    results = mem_get_recent(station=station, history_id=history_id, limit=limit)
-    return [HistorySampleJson(**row) for row in results]
+    samples = history_store.get_recent(station, history_id, limit)
+    return [
+        HistorySampleJson(
+            stationName=s.station_name,
+            historyId=s.history_id,
+            timestamp=s.timestamp,
+            status=s.status,
+            value=s.value,
+        )
+        for s in samples
+    ]
 
 
-@router.get("/debug/comfort_zone_pair", response_model=ComfortZonePairResponse)
+@app.get("/debug/zone_pairs", response_model=List[ZonePairResponse])
+def debug_zone_pairs(
+    station: Optional[str] = Query(None),
+    zone: Optional[str] = Query(None, description="Zone root filter (canonical)"),
+) -> List[ZonePairResponse]:
+    pairs_by_station = zone_pairs_as_dicts()
+    results: List[ZonePairResponse] = []
+
+    for st_name, zones in pairs_by_station.items():
+        if station is not None and st_name != station:
+            continue
+        for zone_root, info in zones.items():
+            if zone is not None and zone_root != zone:
+                continue
+            results.append(
+                ZonePairResponse(
+                    station=st_name,
+                    zone_root=zone_root,
+                    space_temp=info.get("space_temp"),
+                    space_temp_sp=info.get("space_temp_sp"),
+                    flow=info.get("flow"),
+                    flow_sp=info.get("flow_sp"),
+                    damper=info.get("damper"),
+                    reheat=info.get("reheat"),
+                    fan_cmd=info.get("fan_cmd"),
+                    fan_status=info.get("fan_status"),
+                )
+            )
+
+    return results
+
+
+@app.get("/debug/comfort_zone_pair", response_model=ComfortZonePairResponse)
 def debug_comfort_zone_pair(
-    station: str = Query(..., description="Station name, e.g. 'AmsShop'"),
-    temp_history_id: str = Query(..., description="HistoryId for space temperature"),
-    sp_history_id: str = Query(..., description="HistoryId for effective setpoint"),
-    hours: int = Query(24, ge=1, le=72),
-    merge_tolerance_seconds: int = Query(30, ge=1, le=300),
+    station: str = Query(...),
+    temp_history_id: str = Query(...),
+    sp_history_id: str = Query(...),
+    hours: int = Query(24, ge=1, le=168),
+    merge_tolerance_seconds: int = Query(
+        30, ge=1, le=600, description="asof merge tolerance in seconds"
+    ),
 ) -> ComfortZonePairResponse:
-    """
-    Debug endpoint: compute comfort metrics for a temp + setpoint history pair
-    over the last N hours, using nearest-timestamp join with a tolerance.
+    from ..store import sqlite_store as _sqlite_store
+    import pandas as pd
 
-    Data source is the SQLite history_samples table.
-    """
-    now = datetime.utcnow()
-    start = now - timedelta(hours=hours)
+    end = datetime.utcnow()
+    start = end - timedelta(hours=hours)
 
-    rows_temp = sqlite_store.query_series(
-        station=station,
-        history_id=temp_history_id,
-        start=start,
-        end=now,
-        limit=10_000,
-    )
-    rows_sp = sqlite_store.query_series(
-        station=station,
-        history_id=sp_history_id,
-        start=start,
-        end=now,
-        limit=10_000,
-    )
-
+    rows_temp = _sqlite_store.query_series(station, temp_history_id, start, end)
+    rows_sp = _sqlite_store.query_series(station, sp_history_id, start, end)
     df_temp = _rows_to_dataframe(rows_temp)
     df_sp = _rows_to_dataframe(rows_sp)
 
     if df_temp.empty or df_sp.empty:
-        metrics = ComfortMetrics(samples=0, within_band_pct=None, mean_error_degF=None)
-        return ComfortZonePairResponse(
-            history_temp_id=temp_history_id,
-            history_sp_id=sp_history_id,
-            metrics=metrics,
+        raise HTTPException(
+            status_code=404,
+            detail="No data for requested histories in the specified time range.",
         )
 
-    comfort_cfg = _config.comfort
-    ts_col = comfort_cfg.timestamp_column
-    t_col = comfort_cfg.temp_column
-    sp_col = comfort_cfg.setpoint_column
-
-    df_temp = df_temp.rename(columns={"timestamp": ts_col, "value": t_col})
-    df_sp = df_sp.rename(columns={"timestamp": ts_col, "value": sp_col})
-
-    df_temp = df_temp.sort_values(ts_col)
-    df_sp = df_sp.sort_values(ts_col)
-
+    # Build merged frame compatible with compute_zone_comfort
     merged = pd.merge_asof(
-        df_temp,
-        df_sp[[ts_col, sp_col]],
-        on=ts_col,
+        df_temp.sort_values("timestamp").rename(columns={"value": "temp"}),
+        df_sp.sort_values("timestamp").rename(columns={"value": "sp"}),
+        on="timestamp",
         direction="nearest",
         tolerance=pd.Timedelta(seconds=merge_tolerance_seconds),
-    )
+    ).dropna(subset=["temp", "sp"])
 
-    merged = merged.dropna(subset=[sp_col])
-    metrics_dict = compute_zone_comfort(merged, comfort_cfg)
-    metrics = ComfortMetrics(**metrics_dict)
+    if merged.empty:
+        metrics = {"samples": 0, "within_band_pct": None, "mean_error_degF": None}
+    else:
+        # Pretend columns map to comfort config
+        df_for_comfort = merged.rename(
+            columns={"timestamp": "timestamp", "temp": "zn_t", "sp": "zn_sp"}
+        )
+        comfort_cfg: ComfortConfig = _config.comfort
+        tmp_cfg = ComfortConfig(
+            occupied_start=comfort_cfg.occupied_start,
+            occupied_end=comfort_cfg.occupied_end,
+            setpoint_column="zn_sp",
+            temp_column="zn_t",
+            timestamp_column="timestamp",
+            equip_column=comfort_cfg.equip_column,
+            comfort_band_degF=comfort_cfg.comfort_band_degF,
+        )
+        metrics = compute_zone_comfort(df_for_comfort, tmp_cfg)
 
     return ComfortZonePairResponse(
+        station=station,
         history_temp_id=temp_history_id,
         history_sp_id=sp_history_id,
-        metrics=metrics,
-    )
-
-
-@router.get("/debug/zone_pairs", response_model=List[ZonePairResponse])
-def debug_zone_pairs(
-    station: str | None = Query(None, description="Filter by stationName (optional)"),
-    zone: str | None = Query(None, description="Filter by zone label, e.g. 'VAV 1-01' (optional)"),
-) -> List[ZonePairResponse]:
-    """
-    Inspect auto-discovered zone pairings (temp, flow, damper, reheat, fan) for all equipment.
-    """
-    all_pairs = zone_pairs_as_dicts()
-
-    if station:
-        station_key = niagara_canonical_name(station)
-        all_pairs = [p for p in all_pairs if p.get("station_key") == station_key]
-
-    if zone:
-        z = zone.lower().replace("_", "-").replace(" ", "-").strip("-")
-        all_pairs = [p for p in all_pairs if p.get("zone_root") == z]
-
-    return [ZonePairResponse(**p) for p in all_pairs]
-
-
-@router.get("/debug/flow_tracking", response_model=FlowTrackingResponse)
-def debug_flow_tracking(
-    station: str = Query(..., description="Station name, e.g. 'AmsShop'"),
-    zone: str = Query(..., description="Zone label, e.g. 'VAV 1-01'"),
-    start: datetime | None = Query(None, description="Start time (ISO-8601, optional)"),
-    end: datetime | None = Query(None, description="End time (ISO-8601, optional)"),
-) -> FlowTrackingResponse:
-    """
-    Flow vs Flow Setpoint tracking for a single zone, using auto pairing.
-    """
-    station_key = niagara_canonical_name(station)
-    zone_root = zone.lower().replace("_", "-").replace(" ", "-").strip("-")
-
-    zp = find_zone_pair(station_key=station_key, zone_root=zone_root)
-    if zp is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No auto-paired zone found for station={station!r}, zone_root={zone_root!r}",
-        )
-
-    flow_hist = zp.flow
-    flow_sp_hist = zp.flow_sp
-
-    if flow_hist is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No flow historyId detected for this zone.",
-        )
-
-    now = datetime.utcnow()
-    if end is None:
-        end = now
-    if start is None:
-        start = end - timedelta(hours=24)
-
-    rows_flow = sqlite_store.query_series(
-        station=station,
-        history_id=flow_hist,
         start=start,
         end=end,
-        limit=10_000,
+        metrics=ComfortMetricsModel(**metrics),
     )
+
+
+@app.get("/debug/flow_tracking", response_model=FlowTrackingResponse)
+def debug_flow_tracking(
+    station: str = Query(...),
+    zone: str = Query(..., description="Zone root (canonical)"),
+    hours: int = Query(24, ge=1, le=168),
+) -> FlowTrackingResponse:
+    from ..store import sqlite_store as _sqlite_store
+
+    pairs_by_station = zone_pairs_as_dicts()
+    zone_info = find_zone_pair(pairs_by_station, station, zone)
+    if zone_info is None:
+        raise HTTPException(status_code=404, detail="Zone not found for station.")
+
+    flow_id = zone_info.get("flow")
+    flow_sp_id = zone_info.get("flow_sp")
+
+    if not flow_id:
+        raise HTTPException(
+            status_code=404, detail="Zone has no flow history configured."
+        )
+
+    end = datetime.utcnow()
+    start = end - timedelta(hours=hours)
+
+    rows_flow = _sqlite_store.query_series(station, flow_id, start, end)
     df_flow = _rows_to_dataframe(rows_flow)
 
-    df_sp = None
-    if flow_sp_hist is not None:
-        rows_sp = sqlite_store.query_series(
-            station=station,
-            history_id=flow_sp_hist,
-            start=start,
-            end=end,
-            limit=10_000,
-        )
-        df_sp = _rows_to_dataframe(rows_sp)
-
-    if df_flow.empty:
-        metrics = compute_flow_tracking(
-            df_flow=pd.DataFrame(columns=["timestamp", "value"]),
-            df_flow_sp=None,
-            cfg=FlowTrackingConfig(),
-        )
+    if flow_sp_id:
+        rows_flow_sp = _sqlite_store.query_series(station, flow_sp_id, start, end)
+        df_flow_sp = _rows_to_dataframe(rows_flow_sp)
     else:
-        df_flow = df_flow.rename(columns={"timestamp": "timestamp", "value": "value"})
-        if df_sp is not None and not df_sp.empty:
-            df_sp = df_sp.rename(columns={"timestamp": "timestamp", "value": "value"})
-        else:
-            df_sp = None
+        df_flow_sp = _rows_to_dataframe([])
 
-        metrics = compute_flow_tracking(df_flow, df_sp, cfg=FlowTrackingConfig())
+    cfg = FlowTrackingConfig()
+    cfg.timestamp_column = "timestamp"
+    cfg.value_column = "value"
+    cfg.merge_tolerance_seconds = 30
+
+    metrics = compute_flow_tracking(df_flow, df_flow_sp, cfg)
 
     return FlowTrackingResponse(
         station=station,
         zone=zone,
-        flow_history_id=flow_hist,
-        flow_sp_history_id=flow_sp_hist,
+        history_flow_id=flow_id,
+        history_flow_sp_id=flow_sp_id,
         start=start,
         end=end,
-        metrics=metrics,
+        metrics=FlowTrackingMetricsModel(
+            samples=metrics.get("samples", 0),
+            within_band_pct=metrics.get("within_band_pct"),
+            mean_error_cfm=metrics.get("mean_error_cfm"),
+            mean_error_pct=metrics.get("mean_error_pct"),
+        ),
     )
 
 
-@router.get("/summary/zone_health", response_model=ZoneHealthMetricsModel)
+# ---- Summary endpoints -----------------------------------------------------
+
+
+@app.get("/summary/zone_health", response_model=ZoneHealthMetricsModel)
 def summary_zone_health(
-    station: str = Query(..., description="Station name, e.g. 'AmsShop'"),
-    zone: str = Query(..., description="Zone label, e.g. 'VAV 1-01' or 'FPB 3-01'"),
-    hours: int = Query(24, ge=1, le=72),
+    station: str = Query(...),
+    zone: str = Query(..., description="Zone root (canonical)"),
+    hours: int = Query(24, ge=1, le=168),
 ) -> ZoneHealthMetricsModel:
-    """
-    Full health metrics for a single zone/equipment:
-      - comfort
-      - flow tracking
-      - damper sanity
-      - reheat waste
-      - overall score
-    """
-    station_key = niagara_canonical_name(station)
-    zone_root = zone.lower().replace("_", "-").replace(" ", "-").strip("-")
-
-    # Find the zone pair entry
-    pairs = zone_pairs_as_dicts()
-    zp = None
-    for p in pairs:
-        if p.get("station_key") == station_key and p.get("zone_root") == zone_root:
-            zp = p
-            break
-
-    if zp is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No zone pair metadata found for station={station!r}, zone_root={zone_root!r}",
-        )
+    pairs_by_station = zone_pairs_as_dicts()
+    zone_info = find_zone_pair(pairs_by_station, station, zone)
+    if zone_info is None:
+        raise HTTPException(status_code=404, detail="Zone not found for station.")
 
     end = datetime.utcnow()
     start = end - timedelta(hours=hours)
 
     metrics = compute_zone_health(
         station=station,
-        zone_root=zone_root,
-        zone_info=zp,
+        zone_root=zone,
+        zone_info=zone_info,
         comfort_cfg=_config.comfort,
         start=start,
         end=end,
     )
-    mdict = zone_health_to_dict(metrics)
 
-    return ZoneHealthMetricsModel(
-        station=station,
-        zone_root=mdict["zone_root"],
-        space_temp=mdict["space_temp"],
-        space_temp_sp=mdict["space_temp_sp"],
-        flow=mdict["flow"],
-        flow_sp=mdict["flow_sp"],
-        damper=mdict["damper"],
-        reheat=mdict["reheat"],
-        fan_cmd=mdict["fan_cmd"],
-        fan_status=mdict["fan_status"],
-        comfort_samples=mdict["comfort_samples"],
-        comfort_within_band_pct=mdict["comfort_within_band_pct"],
-        comfort_mean_error_degF=mdict["comfort_mean_error_degF"],
-        flow_samples=mdict["flow_samples"],
-        flow_within_band_pct=mdict["flow_within_band_pct"],
-        damper_high_open_low_flow_pct=mdict["damper_high_open_low_flow_pct"],
-        damper_closed_high_flow_pct=mdict["damper_closed_high_flow_pct"],
-        reheat_waste_pct=mdict["reheat_waste_pct"],
-        overall_score=mdict["overall_score"],
-    )
+    return ZoneHealthMetricsModel(**zone_health_to_dict(metrics))
 
 
-@router.get("/summary/building_health", response_model=List[ZoneHealthMetricsModel])
+@app.get("/summary/building_health", response_model=List[ZoneHealthMetricsModel])
 def summary_building_health(
-    station: str = Query(..., description="Station name, e.g. 'AmsShop'"),
-    hours: int = Query(24, ge=1, le=72),
+    station: str = Query(...),
+    hours: int = Query(24, ge=1, le=168),
 ) -> List[ZoneHealthMetricsModel]:
-    """
-    24-hour (or N-hour) health summary for all zones/equipment in a station.
-    Sorted by overall_score ascending (worst first).
-    """
-    station_key = niagara_canonical_name(station)
+    pairs_by_station = zone_pairs_as_dicts()
+    zones = pairs_by_station.get(station)
+    if not zones:
+        raise HTTPException(status_code=404, detail="No zones found for station.")
+
     end = datetime.utcnow()
     start = end - timedelta(hours=hours)
 
-    pairs = zone_pairs_as_dicts()
-    station_pairs = [p for p in pairs if p.get("station_key") == station_key]
-
     results: List[ZoneHealthMetricsModel] = []
 
-    for zp in station_pairs:
-        zone_root = zp.get("zone_root")
+    for zone_root, zone_info in zones.items():
         metrics = compute_zone_health(
             station=station,
             zone_root=zone_root,
-            zone_info=zp,
+            zone_info=zone_info,
             comfort_cfg=_config.comfort,
             start=start,
             end=end,
         )
-        mdict = zone_health_to_dict(metrics)
+        results.append(ZoneHealthMetricsModel(**zone_health_to_dict(metrics)))
 
-        model = ZoneHealthMetricsModel(
-            station=station,
-            zone_root=mdict["zone_root"],
-            space_temp=mdict["space_temp"],
-            space_temp_sp=mdict["space_temp_sp"],
-            flow=mdict["flow"],
-            flow_sp=mdict["flow_sp"],
-            damper=mdict["damper"],
-            reheat=mdict["reheat"],
-            fan_cmd=mdict["fan_cmd"],
-            fan_status=mdict["fan_status"],
-            comfort_samples=mdict["comfort_samples"],
-            comfort_within_band_pct=mdict["comfort_within_band_pct"],
-            comfort_mean_error_degF=mdict["comfort_mean_error_degF"],
-            flow_samples=mdict["flow_samples"],
-            flow_within_band_pct=mdict["flow_within_band_pct"],
-            damper_high_open_low_flow_pct=mdict["damper_high_open_low_flow_pct"],
-            damper_closed_high_flow_pct=mdict["damper_closed_high_flow_pct"],
-            reheat_waste_pct=mdict["reheat_waste_pct"],
-            overall_score=mdict["overall_score"],
+    # Sort worst first: primary by status, secondary by overall score ascending
+    status_order = {"critical": 0, "warning": 1, "ok": 2, "no_data": 3}
+
+    def sort_key(m: ZoneHealthMetricsModel) -> Any:
+        return (
+            status_order.get(m.status, 3),
+            float("inf") if m.overall_score is None else m.overall_score,
         )
-        results.append(model)
 
-    # Sort by overall_score (worst first); None scores go to the bottom
-    results.sort(
-        key=lambda m: (m.overall_score is None, m.overall_score if m.overall_score is not None else 999.0)
-    )
-
+    results.sort(key=sort_key)
     return results
 
 
-# Mount router
-app.include_router(router)
+# ---- Haystack test endpoints ----------------------------------------------
+
+
+@app.get("/haystack/test/zoneTemps")
+def haystack_test_zone_temps(
+    site_ref: Optional[str] = Query(
+        default=None, description="Optional siteRef id (without @)"
+    )
+) -> Dict[str, Any]:
+    if _haystack_client is None:
+        raise HTTPException(
+            status_code=500, detail="Haystack client not initialised or disabled."
+        )
+
+    try:
+        points = _haystack_client.find_zone_temp_points(site_ref=site_ref, limit=500)
+        points_norm = _normalize_for_json(points)
+        return {"count": len(points_norm), "points": points_norm}
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        print("[error] haystack_test_zoneTemps failed:\n", tb)  # noqa: T201
+        raise HTTPException(status_code=500, detail=f"Haystack error: {e}")
+
+
+@app.get("/haystack/test/history")
+def haystack_test_history(
+    id: str = Query(..., description="Haystack id, e.g. @vav-3-04-zn-t"),
+    range: str = Query(
+        "today",
+        description="Haystack range string, e.g. 'today' or '2025-11-27,2025-11-28'",
+    ),
+) -> Dict[str, Any]:
+    if _haystack_client is None:
+        raise HTTPException(
+            status_code=500, detail="Haystack client not initialised or disabled."
+        )
+
+    try:
+        samples = _haystack_client.his_read(id, range)
+        samples_norm = [
+            {"ts": ts.isoformat(), "val": float(val)} for ts, val in samples
+        ]
+        return {
+            "id": id,
+            "range": range,
+            "samples": samples_norm,
+        }
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        print("[error] haystack_test_history failed:\n", tb)  # noqa: T201
+        raise HTTPException(status_code=500, detail=f"Haystack error: {e}")

@@ -1,329 +1,476 @@
-# src/analytics/zone_health.py
-
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, time, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from ..config import ComfortConfig
-from ..analytics.comfort import compute_zone_comfort
-from ..analytics.flow import compute_flow_tracking, FlowTrackingConfig
 from ..store import sqlite_store
+from .flow import compute_flow_tracking, FlowTrackingConfig
+
+
+MERGE_TOLERANCE_SECONDS = 30
 
 
 @dataclass
 class ZoneHealthMetrics:
+    # Identity / wiring
+    station: str
     zone_root: str
 
-    # History IDs for context
-    space_temp: Optional[str]
-    space_temp_sp: Optional[str]
-    flow: Optional[str]
-    flow_sp: Optional[str]
-    damper: Optional[str]
-    reheat: Optional[str]
-    fan_cmd: Optional[str]
-    fan_status: Optional[str]
+    space_temp: Optional[str] = None
+    space_temp_sp: Optional[str] = None
+    flow: Optional[str] = None
+    flow_sp: Optional[str] = None
+    damper: Optional[str] = None
+    reheat: Optional[str] = None
+    fan_cmd: Optional[str] = None
+    fan_status: Optional[str] = None
 
-    # Comfort
+    # Comfort metrics
     comfort_samples: int = 0
     comfort_within_band_pct: Optional[float] = None
     comfort_mean_error_degF: Optional[float] = None
 
-    # Flow tracking
+    # Flow metrics
     flow_samples: int = 0
     flow_within_band_pct: Optional[float] = None
+    mean_flow_error_cfm: Optional[float] = None
+    mean_flow_error_pct: Optional[float] = None
 
-    # Flow vs damper sanity checks
+    # Damper sanity metrics
     damper_high_open_low_flow_pct: Optional[float] = None
     damper_closed_high_flow_pct: Optional[float] = None
 
-    # Reheat heat-wasting detection
+    # Reheat metrics (mostly placeholder for now)
     reheat_waste_pct: Optional[float] = None
 
-    # Aggregate score (0–100, higher is better)
+    # Fan metrics (Phase 2 will use these)
+    fan_disagree_pct: Optional[float] = None
+    fan_off_when_should_be_on_pct: Optional[float] = None
+    fan_short_cycle_count: Optional[int] = None
+
+    # Overall score (0–100, higher is healthier)
     overall_score: Optional[float] = None
+
+    # NEW: diagnostic classification
+    status: str = "no_data"          # "critical" | "warning" | "ok" | "no_data"
+    reasons: List[str] = field(default_factory=list)
 
 
 def _query_series_df(
     station: str,
     history_id: Optional[str],
-    start: datetime,
-    end: datetime,
-    value_col: str = "value",
+    start: Optional[datetime],
+    end: Optional[datetime],
 ) -> pd.DataFrame:
-    """
-    Load a single history series from SQLite into a DataFrame with:
-      - timestamp: naive UTC datetime
-      - <value_col>: float or numeric
+    """Query a single history series from sqlite and return a DataFrame.
 
-    Handles mixed ISO8601 formats (with/without microseconds, with tz offset).
+    Columns: timestamp (datetime, naive UTC), value (float).
     """
     if not history_id:
-        return pd.DataFrame(columns=["timestamp", value_col])
+        return pd.DataFrame(columns=["timestamp", "value"])
 
     rows = sqlite_store.query_series(
         station=station,
         history_id=history_id,
         start=start,
         end=end,
-        limit=10_000,
     )
     if not rows:
-        return pd.DataFrame(columns=["timestamp", value_col])
+        return pd.DataFrame(columns=["timestamp", "value"])
 
     df = pd.DataFrame(rows)
-    if "timestamp" in df.columns:
-        # Parse mixed ISO8601 strings and normalise to naive UTC
-        ts = pd.to_datetime(
-            df["timestamp"],
-            format="mixed",   # allows both with and without microseconds
-            utc=True,
-            errors="coerce",
-        )
-        # Drop timezone (keep UTC clock time as naive)
-        df["timestamp"] = ts.dt.tz_localize(None)
+    # Expecting 'ts' and 'value' from sqlite_store
+    if "ts" not in df.columns or "value" not in df.columns:
+        return pd.DataFrame(columns=["timestamp", "value"])
 
-    df = df.rename(columns={"timestamp": "timestamp", "value": value_col})
+    # Mixed ISO formats; parse robustly and normalize to naive UTC
+    ts = pd.to_datetime(df["ts"], utc=True, format="mixed", errors="coerce")
+    df = df.assign(timestamp=ts.dt.tz_convert("UTC").dt.tz_localize(None))
+    df = df.dropna(subset=["timestamp"])
     df = df.sort_values("timestamp")
-    return df
+    return df[["timestamp", "value"]].reset_index(drop=True)
 
 
+def _parse_time(s: str) -> time:
+    h, m = map(int, s.split(":"))
+    return time(hour=h, minute=m)
 
-def _compute_comfort(
-    station: str,
-    zone_root: str,
-    space_temp_id: Optional[str],
-    space_temp_sp_id: Optional[str],
-    start: datetime,
-    end: datetime,
+
+def _compute_comfort_metrics(
+    df_temp: pd.DataFrame,
+    df_sp: pd.DataFrame,
     comfort_cfg: ComfortConfig,
-) -> Dict[str, Any]:
-    if not space_temp_id or not space_temp_sp_id:
-        return {
-            "samples": 0,
-            "within_band_pct": None,
-            "mean_error_degF": None,
-        }
+) -> Tuple[int, Optional[float], Optional[float]]:
+    """Return (samples, within_band_pct, mean_error_degF) for occupied window."""
+    if df_temp.empty or df_sp.empty:
+        return 0, None, None
 
-    df_t = _query_series_df(station, space_temp_id, start, end, value_col=comfort_cfg.temp_column)
-    df_sp = _query_series_df(station, space_temp_sp_id, start, end, value_col=comfort_cfg.setpoint_column)
-    if df_t.empty or df_sp.empty:
-        return {
-            "samples": 0,
-            "within_band_pct": None,
-            "mean_error_degF": None,
-        }
-
-    ts_col = comfort_cfg.timestamp_column
-    df_t = df_t.rename(columns={"timestamp": ts_col})
-    df_sp = df_sp.rename(columns={"timestamp": ts_col})
-
-    df_t = df_t.sort_values(ts_col)
-    df_sp = df_sp.sort_values(ts_col)
-
+    # Align temp and setpoint by nearest timestamp
     merged = pd.merge_asof(
-        df_t,
-        df_sp[[ts_col, comfort_cfg.setpoint_column]],
-        on=ts_col,
-        direction="nearest",
-        tolerance=pd.Timedelta(seconds=30),
-    )
-    merged = merged.dropna(subset=[comfort_cfg.setpoint_column])
-
-    if merged.empty:
-        return {
-            "samples": 0,
-            "within_band_pct": None,
-            "mean_error_degF": None,
-        }
-
-    metrics = compute_zone_comfort(merged, comfort_cfg)
-    return metrics
-
-
-def _compute_flow_and_damper(
-    station: str,
-    flow_id: Optional[str],
-    flow_sp_id: Optional[str],
-    damper_id: Optional[str],
-    start: datetime,
-    end: datetime,
-) -> Dict[str, Any]:
-    # Flow tracking using existing analytics
-    df_flow = _query_series_df(station, flow_id, start, end, value_col="value")
-    df_sp = _query_series_df(station, flow_sp_id, start, end, value_col="value") if flow_sp_id else None
-
-    flow_metrics = compute_flow_tracking(df_flow, df_sp, cfg=FlowTrackingConfig())
-
-    # Flow vs damper sanity only if we have both series
-    if not flow_id or not damper_id:
-        return {
-            "flow_samples": flow_metrics.get("samples", 0),
-            "flow_within_band_pct": flow_metrics.get("within_band_pct"),
-            "damper_high_open_low_flow_pct": None,
-            "damper_closed_high_flow_pct": None,
-        }
-
-    df_damper = _query_series_df(station, damper_id, start, end, value_col="damper")
-    if df_damper.empty or df_flow.empty:
-        return {
-            "flow_samples": flow_metrics.get("samples", 0),
-            "flow_within_band_pct": flow_metrics.get("within_band_pct"),
-            "damper_high_open_low_flow_pct": None,
-            "damper_closed_high_flow_pct": None,
-        }
-
-    # Align flow and damper
-    merged = pd.merge_asof(
-        df_flow.sort_values("timestamp").rename(columns={"value": "flow"}),
-        df_damper.sort_values("timestamp"),
+        df_temp.sort_values("timestamp"),
+        df_sp.sort_values("timestamp"),
         on="timestamp",
         direction="nearest",
-        tolerance=pd.Timedelta(seconds=30),
-    ).dropna(subset=["flow", "damper"])
+        tolerance=pd.Timedelta(seconds=MERGE_TOLERANCE_SECONDS),
+        suffixes=("_temp", "_sp"),
+    )
 
+    merged = merged.dropna(subset=["value_temp", "value_sp"])
     if merged.empty:
-        return {
-            "flow_samples": flow_metrics.get("samples", 0),
-            "flow_within_band_pct": flow_metrics.get("within_band_pct"),
-            "damper_high_open_low_flow_pct": None,
-            "damper_closed_high_flow_pct": None,
-        }
+        return 0, None, None
 
-    # Thresholds based on median flow
-    median_flow = merged["flow"].median()
-    if median_flow <= 0:
-        low_flow_thr = None
-        high_flow_thr = None
+    occ_start = _parse_time(comfort_cfg.occupied_start)
+    occ_end = _parse_time(comfort_cfg.occupied_end)
+    merged["time"] = merged["timestamp"].dt.time
+
+    occupied = merged[
+        (merged["time"] >= occ_start) & (merged["time"] <= occ_end)
+    ].copy()
+
+    if occupied.empty:
+        return 0, None, None
+
+    occupied["error"] = occupied["value_temp"] - occupied["value_sp"]
+    occupied["abs_error"] = occupied["error"].abs()
+
+    samples = int(len(occupied))
+    within_band = (occupied["abs_error"] <= comfort_cfg.comfort_band_degF).sum()
+    within_band_pct = float(within_band / samples * 100.0)
+    mean_error = float(occupied["error"].mean())
+
+    return samples, within_band_pct, mean_error
+
+
+def _compute_flow_and_damper_metrics(
+    df_flow: pd.DataFrame,
+    df_flow_sp: pd.DataFrame,
+    df_damper: pd.DataFrame,
+) -> Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Compute flow tracking and damper sanity metrics.
+
+    Returns:
+        flow_samples,
+        flow_within_band_pct,
+        mean_error_cfm,
+        damper_high_open_low_flow_pct,
+        damper_closed_high_flow_pct
+    """
+    flow_samples = 0
+    flow_within_band_pct = None
+    mean_error_cfm = None
+    damper_high_open_low_flow_pct = None
+    damper_closed_high_flow_pct = None
+
+    # Flow tracking
+    if not df_flow.empty:
+        if df_flow_sp.empty:
+            # Treat single series as flow with no SP; we can still count samples but not tracking
+            flow_samples = int(len(df_flow))
+        else:
+            # Adapt frames for compute_flow_tracking
+            cfg = FlowTrackingConfig()
+            cfg.timestamp_column = "timestamp"
+            cfg.value_column = "value"
+            cfg.merge_tolerance_seconds = MERGE_TOLERANCE_SECONDS
+
+            metrics = compute_flow_tracking(df_flow, df_flow_sp, cfg)
+            flow_samples = int(metrics.get("samples", 0))
+            flow_within_band_pct = metrics.get("within_band_pct")
+            mean_error_cfm = metrics.get("mean_error_cfm")
+
+    # Damper sanity (requires at least flow + damper; use flow_sp if available)
+    if df_damper.empty or df_flow.empty:
+        return (
+            flow_samples,
+            flow_within_band_pct,
+            mean_error_cfm,
+            damper_high_open_low_flow_pct,
+            damper_closed_high_flow_pct,
+        )
+
+    merged = pd.merge_asof(
+        df_damper.sort_values("timestamp").rename(columns={"value": "damper"}),
+        df_flow.sort_values("timestamp").rename(columns={"value": "flow"}),
+        on="timestamp",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=MERGE_TOLERANCE_SECONDS),
+    )
+
+    if not df_flow_sp.empty:
+        merged = pd.merge_asof(
+            merged.sort_values("timestamp"),
+            df_flow_sp.sort_values("timestamp").rename(columns={"value": "flow_sp"}),
+            on="timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=MERGE_TOLERANCE_SECONDS),
+        )
     else:
-        low_flow_thr = 0.3 * median_flow
-        high_flow_thr = 0.7 * median_flow
+        merged["flow_sp"] = None
 
-    if low_flow_thr is None or high_flow_thr is None:
-        high_open_low_flow_pct = None
-        closed_high_flow_pct = None
+    merged = merged.dropna(subset=["damper", "flow"])
+    if merged.empty:
+        return (
+            flow_samples,
+            flow_within_band_pct,
+            mean_error_cfm,
+            damper_high_open_low_flow_pct,
+            damper_closed_high_flow_pct,
+        )
+
+    total = len(merged)
+
+    # Define "high open" and "closed"
+    high_open = merged["damper"] >= 80.0
+    closed = merged["damper"] <= 5.0
+
+    # Define "low flow" vs "high flow" relative to SP if present; otherwise heuristics
+    if merged["flow_sp"].notna().any():
+        # Use SP if we have it
+        merged_valid_sp = merged.dropna(subset=["flow_sp"]).copy()
+        if not merged_valid_sp.empty:
+            low_flow = merged_valid_sp["flow"] < 0.5 * merged_valid_sp["flow_sp"]
+            high_flow = merged_valid_sp["flow"] > 0.8 * merged_valid_sp["flow_sp"]
+            high_open_low_flow = (high_open.loc[merged_valid_sp.index] & low_flow).sum()
+            closed_high_flow = (closed.loc[merged_valid_sp.index] & high_flow).sum()
+            denom = len(merged_valid_sp)
+        else:
+            high_open_low_flow = 0
+            closed_high_flow = 0
+            denom = total
     else:
-        high_open_low_flow = (merged["damper"] >= 90.0) & (merged["flow"] < low_flow_thr)
-        closed_high_flow = (merged["damper"] <= 10.0) & (merged["flow"] > high_flow_thr)
+        # No SP – use relative thresholds based on observed flow distribution
+        f = merged["flow"]
+        if f.max() <= 0:
+            high_open_low_flow = 0
+            closed_high_flow = 0
+            denom = total
+        else:
+            low_flow = f < 0.3 * f.max()
+            high_flow = f > 0.7 * f.max()
+            high_open_low_flow = (high_open & low_flow).sum()
+            closed_high_flow = (closed & high_flow).sum()
+            denom = total
 
-        total = len(merged)
-        high_open_low_flow_pct = float(high_open_low_flow.sum() * 100.0 / total) if total > 0 else None
-        closed_high_flow_pct = float(closed_high_flow.sum() * 100.0 / total) if total > 0 else None
+    if denom > 0:
+        damper_high_open_low_flow_pct = float(high_open_low_flow / denom * 100.0)
+        damper_closed_high_flow_pct = float(closed_high_flow / denom * 100.0)
 
-    return {
-        "flow_samples": flow_metrics.get("samples", 0),
-        "flow_within_band_pct": flow_metrics.get("within_band_pct"),
-        "damper_high_open_low_flow_pct": high_open_low_flow_pct,
-        "damper_closed_high_flow_pct": closed_high_flow_pct,
-    }
+    return (
+        flow_samples,
+        flow_within_band_pct,
+        mean_error_cfm,
+        damper_high_open_low_flow_pct,
+        damper_closed_high_flow_pct,
+    )
 
 
-def _compute_reheat_waste(
-    station: str,
-    reheat_id: Optional[str],
-    space_temp_id: Optional[str],
-    space_temp_sp_id: Optional[str],
-    start: datetime,
-    end: datetime,
+def _compute_reheat_waste_metrics(
+    df_reheat: pd.DataFrame,
+    df_temp: pd.DataFrame,
+    df_sp: pd.DataFrame,
     comfort_cfg: ComfortConfig,
-    waste_deadband_degF: float = 1.0,
 ) -> Optional[float]:
-    if not reheat_id or not space_temp_id or not space_temp_sp_id:
+    """Estimate reheat waste percentage (occupied samples with reheat > 0 while hot).
+
+    For now we keep this simple and do not feed it into status; Phase 3 will refine.
+    """
+    if df_reheat.empty or df_temp.empty or df_sp.empty:
         return None
 
-    df_t = _query_series_df(station, space_temp_id, start, end, value_col=comfort_cfg.temp_column)
-    df_sp = _query_series_df(station, space_temp_sp_id, start, end, value_col=comfort_cfg.setpoint_column)
-    df_rh = _query_series_df(station, reheat_id, start, end, value_col="reheat")
-
-    if df_t.empty or df_sp.empty or df_rh.empty:
-        return None
-
-    ts_col = comfort_cfg.timestamp_column
-    df_t = df_t.rename(columns={"timestamp": ts_col})
-    df_sp = df_sp.rename(columns={"timestamp": ts_col})
-    df_rh = df_rh.rename(columns={"timestamp": ts_col})
-
-    df_t = df_t.sort_values(ts_col)
-    df_sp = df_sp.sort_values(ts_col)
-    df_rh = df_rh.sort_values(ts_col)
-
     merged = pd.merge_asof(
-        df_t,
-        df_sp[[ts_col, comfort_cfg.setpoint_column]],
-        on=ts_col,
+        df_reheat.sort_values("timestamp").rename(columns={"value": "reheat"}),
+        df_temp.sort_values("timestamp").rename(columns={"value": "temp"}),
+        on="timestamp",
         direction="nearest",
-        tolerance=pd.Timedelta(seconds=30),
-    )
-    merged = pd.merge_asof(
-        merged,
-        df_rh[[ts_col, "reheat"]],
-        on=ts_col,
-        direction="nearest",
-        tolerance=pd.Timedelta(seconds=30),
+        tolerance=pd.Timedelta(seconds=MERGE_TOLERANCE_SECONDS),
     )
 
-    merged = merged.dropna(subset=[comfort_cfg.setpoint_column, "reheat"])
+    merged = pd.merge_asof(
+        merged.sort_values("timestamp"),
+        df_sp.sort_values("timestamp").rename(columns={"value": "sp"}),
+        on="timestamp",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=MERGE_TOLERANCE_SECONDS),
+    )
+
+    merged = merged.dropna(subset=["reheat", "temp", "sp"])
     if merged.empty:
         return None
 
-    # Reheat "waste" where reheat > 0 but space temp is already above SP + deadband
-    temp_col = comfort_cfg.temp_column
-    sp_col = comfort_cfg.setpoint_column
+    occ_start = _parse_time(comfort_cfg.occupied_start)
+    occ_end = _parse_time(comfort_cfg.occupied_end)
+    merged["time"] = merged["timestamp"].dt.time
 
-    reheat_on = merged["reheat"] > 0.0
-    waste_mask = reheat_on & (merged[temp_col] > merged[sp_col] + waste_deadband_degF)
-
-    total_on = int(reheat_on.sum())
-    if total_on == 0:
+    occupied = merged[
+        (merged["time"] >= occ_start) & (merged["time"] <= occ_end)
+    ].copy()
+    if occupied.empty:
         return None
 
-    waste_pct = float(waste_mask.sum() * 100.0 / total_on)
+    # Simple heuristic: any positive reheat above 10% while > 1°F above setpoint
+    hot_and_reheat = (occupied["reheat"] > 10.0) & (
+        occupied["temp"] >= occupied["sp"] + 1.0
+    )
+    total = len(occupied)
+    waste_pct = float(hot_and_reheat.sum() / total * 100.0) if total > 0 else None
     return waste_pct
 
 
-def _compute_overall_score(
-    comfort_within_band_pct: Optional[float],
-    flow_within_band_pct: Optional[float],
-    damper_high_open_low_flow_pct: Optional[float],
-    damper_closed_high_flow_pct: Optional[float],
-    reheat_waste_pct: Optional[float],
-) -> Optional[float]:
-    # Higher comfort/flow percentages are good; higher "bad" percentages are bad.
-    parts = []
-    weights = []
+def _compute_overall_score(metrics: ZoneHealthMetrics) -> Optional[float]:
+    """Combine metrics into a single 0–100 score.
 
-    # Comfort: weight 3
-    if comfort_within_band_pct is not None:
-        parts.append(comfort_within_band_pct)
+    Weights (initial):
+      - comfort: ×3
+      - flow: ×2
+      - damper: ×1 (penalize anomalies)
+      - reheat: ×1 (penalize waste when present)
+    """
+    components: List[float] = []
+    weights: List[float] = []
+
+    # Comfort (direct)
+    if metrics.comfort_within_band_pct is not None:
+        components.append(metrics.comfort_within_band_pct)
         weights.append(3.0)
 
-    # Flow tracking: weight 2
-    if flow_within_band_pct is not None:
-        parts.append(flow_within_band_pct)
+    # Flow (direct)
+    if metrics.flow_within_band_pct is not None:
+        components.append(metrics.flow_within_band_pct)
         weights.append(2.0)
 
-    # Damper issues: we interpret as 100 - bad_percent
-    if damper_high_open_low_flow_pct is not None:
-        parts.append(max(0.0, 100.0 - damper_high_open_low_flow_pct))
+    # Damper anomalies (inverse)
+    if metrics.damper_high_open_low_flow_pct is not None:
+        components.append(max(0.0, 100.0 - metrics.damper_high_open_low_flow_pct))
         weights.append(1.0)
-    if damper_closed_high_flow_pct is not None:
-        parts.append(max(0.0, 100.0 - damper_closed_high_flow_pct))
-        weights.append(1.0)
-
-    # Reheat waste: interpret as 100 - waste
-    if reheat_waste_pct is not None:
-        parts.append(max(0.0, 100.0 - reheat_waste_pct))
+    if metrics.damper_closed_high_flow_pct is not None:
+        components.append(max(0.0, 100.0 - metrics.damper_closed_high_flow_pct))
         weights.append(1.0)
 
-    if not weights:
+    # Reheat waste (inverse)
+    if metrics.reheat_waste_pct is not None:
+        components.append(max(0.0, 100.0 - metrics.reheat_waste_pct))
+        weights.append(1.0)
+
+    if not components:
         return None
 
-    score = sum(p * w for p, w in zip(parts, weights)) / sum(weights)
-    return float(score)
+    weighted = sum(c * w for c, w in zip(components, weights))
+    total_w = sum(weights)
+    return float(weighted / total_w)
+
+
+def _derive_status_and_reasons(m: ZoneHealthMetrics) -> None:
+    """Set m.status and m.reasons based on current metrics.
+
+    Rules (initial):
+      - no_data:
+          - comfort_samples == 0 OR both comfort_within_band_pct and flow_within_band_pct are None
+      - critical:
+          - comfort_within_band_pct < 50 and mean_error <= -3.0  -> cold_zone
+          - comfort_within_band_pct < 50 and mean_error >= +3.0  -> hot_zone
+          - flow_within_band_pct < 40                            -> poor_flow_tracking
+          - damper_high_open_low_flow_pct > 30                   -> damper_leak
+          - damper_closed_high_flow_pct > 30                     -> damper_stuck
+      - warning:
+          - comfort_within_band_pct between 50–80
+          - flow_within_band_pct between 40–70
+          - damper anomaly pct between 10–30
+      - ok:
+          - everything else
+    """
+    reasons: List[str] = []
+
+    # Determine if we effectively have no data
+    if m.comfort_samples == 0 and (
+        m.flow_within_band_pct is None and m.comfort_within_band_pct is None
+    ):
+        m.status = "no_data"
+        m.reasons = []
+        return
+
+    # ------------------
+    # Critical conditions
+    # ------------------
+    critical = False
+
+    if m.comfort_within_band_pct is not None and m.comfort_mean_error_degF is not None:
+        if m.comfort_within_band_pct < 50.0 and m.comfort_mean_error_degF <= -3.0:
+            critical = True
+            reasons.append("cold_zone")
+        if m.comfort_within_band_pct < 50.0 and m.comfort_mean_error_degF >= 3.0:
+            critical = True
+            reasons.append("hot_zone")
+
+    if m.flow_within_band_pct is not None and m.flow_within_band_pct < 40.0:
+        critical = True
+        reasons.append("poor_flow_tracking")
+
+    if (
+        m.damper_high_open_low_flow_pct is not None
+        and m.damper_high_open_low_flow_pct > 30.0
+    ):
+        critical = True
+        reasons.append("damper_leak")
+
+    if (
+        m.damper_closed_high_flow_pct is not None
+        and m.damper_closed_high_flow_pct > 30.0
+    ):
+        critical = True
+        reasons.append("damper_stuck")
+
+    if critical:
+        m.status = "critical"
+        m.reasons = sorted(set(reasons))
+        return
+
+    # ---------------
+    # Warning signals
+    # ---------------
+    warning = False
+
+    if m.comfort_within_band_pct is not None:
+        if 50.0 <= m.comfort_within_band_pct < 80.0:
+            warning = True
+            if m.comfort_mean_error_degF is not None:
+                if m.comfort_mean_error_degF <= -2.0:
+                    reasons.append("slightly_cold_zone")
+                elif m.comfort_mean_error_degF >= 2.0:
+                    reasons.append("slightly_hot_zone")
+                else:
+                    reasons.append("borderline_comfort")
+            else:
+                reasons.append("borderline_comfort")
+
+    if m.flow_within_band_pct is not None:
+        if 40.0 <= m.flow_within_band_pct < 70.0:
+            warning = True
+            reasons.append("borderline_flow_tracking")
+
+    if m.damper_high_open_low_flow_pct is not None:
+        if 10.0 < m.damper_high_open_low_flow_pct <= 30.0:
+            warning = True
+            reasons.append("possible_damper_leak")
+
+    if m.damper_closed_high_flow_pct is not None:
+        if 10.0 < m.damper_closed_high_flow_pct <= 30.0:
+            warning = True
+            reasons.append("possible_damper_stuck")
+
+    if warning:
+        m.status = "warning"
+        m.reasons = sorted(set(reasons))
+        return
+
+    # ----
+    # OK
+    # ----
+    m.status = "ok"
+    m.reasons = []
 
 
 def compute_zone_health(
@@ -334,94 +481,71 @@ def compute_zone_health(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
 ) -> ZoneHealthMetrics:
+    """Compute ZoneHealthMetrics for a single zone root.
+
+    zone_info is typically a dict from zone_pairs_as_dicts()[station][zone_root].
     """
-    Compute comfort, flow tracking, damper sanity, reheat waste, and an
-    overall score for a single zone/equipment root.
-    """
+    metrics = ZoneHealthMetrics(
+        station=station,
+        zone_root=zone_root,
+        space_temp=zone_info.get("space_temp"),
+        space_temp_sp=zone_info.get("space_temp_sp"),
+        flow=zone_info.get("flow"),
+        flow_sp=zone_info.get("flow_sp"),
+        damper=zone_info.get("damper"),
+        reheat=zone_info.get("reheat"),
+        fan_cmd=zone_info.get("fan_cmd"),
+        fan_status=zone_info.get("fan_status"),
+    )
+
+    # Default time range: last 24 hours if not provided
     if end is None:
         end = datetime.utcnow()
     if start is None:
         start = end - timedelta(hours=24)
 
-    space_temp_id = zone_info.get("space_temp")
-    space_temp_sp_id = zone_info.get("space_temp_sp")
-    flow_id = zone_info.get("flow")
-    flow_sp_id = zone_info.get("flow_sp")
-    damper_id = zone_info.get("damper")
-    reheat_id = zone_info.get("reheat")
-    fan_cmd_id = zone_info.get("fan_cmd")
-    fan_status_id = zone_info.get("fan_status")
+    # Query all series we might use
+    df_temp = _query_series_df(station, metrics.space_temp, start, end)
+    df_sp = _query_series_df(station, metrics.space_temp_sp, start, end)
+    df_flow = _query_series_df(station, metrics.flow, start, end)
+    df_flow_sp = _query_series_df(station, metrics.flow_sp, start, end)
+    df_damper = _query_series_df(station, metrics.damper, start, end)
+    df_reheat = _query_series_df(station, metrics.reheat, start, end)
 
     # Comfort
-    comfort = _compute_comfort(
-        station=station,
-        zone_root=zone_root,
-        space_temp_id=space_temp_id,
-        space_temp_sp_id=space_temp_sp_id,
-        start=start,
-        end=end,
-        comfort_cfg=comfort_cfg,
-    )
+    (
+        metrics.comfort_samples,
+        metrics.comfort_within_band_pct,
+        metrics.comfort_mean_error_degF,
+    ) = _compute_comfort_metrics(df_temp, df_sp, comfort_cfg)
 
     # Flow + damper
-    flow_damper = _compute_flow_and_damper(
-        station=station,
-        flow_id=flow_id,
-        flow_sp_id=flow_sp_id,
-        damper_id=damper_id,
-        start=start,
-        end=end,
+    (
+        metrics.flow_samples,
+        metrics.flow_within_band_pct,
+        metrics.mean_flow_error_cfm,
+        metrics.damper_high_open_low_flow_pct,
+        metrics.damper_closed_high_flow_pct,
+    ) = _compute_flow_and_damper_metrics(df_flow, df_flow_sp, df_damper)
+
+    # Reheat waste (not yet used in status)
+    metrics.reheat_waste_pct = _compute_reheat_waste_metrics(
+        df_reheat, df_temp, df_sp, comfort_cfg
     )
 
-    # Reheat waste
-    reheat_waste = _compute_reheat_waste(
-        station=station,
-        reheat_id=reheat_id,
-        space_temp_id=space_temp_id,
-        space_temp_sp_id=space_temp_sp_id,
-        start=start,
-        end=end,
-        comfort_cfg=comfort_cfg,
-    )
+    # Overall score
+    metrics.overall_score = _compute_overall_score(metrics)
 
-    comfort_samples = int(comfort.get("samples", 0) or 0)
-    comfort_within = comfort.get("within_band_pct")
-    comfort_err = comfort.get("mean_error_degF")
+    # Status + reasons
+    _derive_status_and_reasons(metrics)
 
-    flow_samples = int(flow_damper.get("flow_samples", 0) or 0)
-    flow_within = flow_damper.get("flow_within_band_pct")
-    damper_high_open_low_flow_pct = flow_damper.get("damper_high_open_low_flow_pct")
-    damper_closed_high_flow_pct = flow_damper.get("damper_closed_high_flow_pct")
-
-    overall = _compute_overall_score(
-        comfort_within_band_pct=comfort_within,
-        flow_within_band_pct=flow_within,
-        damper_high_open_low_flow_pct=damper_high_open_low_flow_pct,
-        damper_closed_high_flow_pct=damper_closed_high_flow_pct,
-        reheat_waste_pct=reheat_waste,
-    )
-
-    return ZoneHealthMetrics(
-        zone_root=zone_root,
-        space_temp=space_temp_id,
-        space_temp_sp=space_temp_sp_id,
-        flow=flow_id,
-        flow_sp=flow_sp_id,
-        damper=damper_id,
-        reheat=reheat_id,
-        fan_cmd=fan_cmd_id,
-        fan_status=fan_status_id,
-        comfort_samples=comfort_samples,
-        comfort_within_band_pct=comfort_within,
-        comfort_mean_error_degF=comfort_err,
-        flow_samples=flow_samples,
-        flow_within_band_pct=flow_within,
-        damper_high_open_low_flow_pct=damper_high_open_low_flow_pct,
-        damper_closed_high_flow_pct=damper_closed_high_flow_pct,
-        reheat_waste_pct=reheat_waste,
-        overall_score=overall,
-    )
+    return metrics
 
 
-def zone_health_to_dict(m: ZoneHealthMetrics) -> Dict[str, Any]:
-    return asdict(m)
+def zone_health_to_dict(metrics: ZoneHealthMetrics) -> Dict[str, Any]:
+    """Flatten ZoneHealthMetrics into a JSON-serializable dict."""
+    d = asdict(metrics)
+    # Ensure reasons is always a list, status always a string
+    d.setdefault("status", "no_data")
+    d.setdefault("reasons", [])
+    return d
