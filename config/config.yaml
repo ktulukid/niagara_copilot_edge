@@ -21,6 +21,7 @@ mqtt:
   host: "localhost"
   port: 1883
   history_topic: "niagara/histories"
+  equipment_topic: "niagara/equipment"
 
 db_path: "data/history.sqlite"
 db_retention_hours: 720

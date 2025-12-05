@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 import os
+import sqlite3
 import traceback
 
 from fastapi import FastAPI, HTTPException, Query
@@ -13,10 +14,8 @@ from ..analytics.zone_pairs import zone_pairs_as_dicts, find_zone_pair
 from ..analytics.zone_health import compute_zone_health, zone_health_to_dict
 from ..analytics.flow import compute_flow_tracking, FlowTrackingConfig
 from ..analytics.comfort import compute_zone_comfort
-from ..niagara_client.mqtt_history_ingest import (
-    HistorySample,
-    make_history_mqtt_client,
-)
+from ..analytics.rtu import compute_rtu_health, rtu_health_to_dict
+from ..niagara_client.mqtt_history_ingest import make_history_mqtt_client
 from ..store import history_store, sqlite_store
 from ..niagara_client.haystack_client import (
     HaystackHistoryClient,
@@ -34,18 +33,10 @@ _config: AppConfig = load_config()
 sqlite_store.init(_config.db_path, _config.db_retention_hours)
 
 # MQTT history ingestion → history_store + sqlite_store
+# The mqtt_history_ingest module's callback now writes directly to both stores,
+# so we just need to construct the client with the full AppConfig.
 try:
-
-    def _on_history_batch(samples: List[HistorySample]) -> None:
-        # In-memory store (debug)
-        history_store.add_batch(samples)
-        # Durable store
-        sqlite_store.add_batch(samples)
-
-    _mqtt_client = make_history_mqtt_client(
-        mqtt_config=_config.mqtt,
-        on_batch=_on_history_batch,
-    )
+    _mqtt_client = make_history_mqtt_client(_config)
 except Exception as e:  # noqa: BLE001
     # We don't crash the API if MQTT fails; just log and continue.
     print(f"[warn] MQTT history client init failed: {e}")  # noqa: T201
@@ -135,6 +126,9 @@ class FlowTrackingResponse(BaseModel):
 class ZonePairResponse(BaseModel):
     station: str
     zone_root: str
+    equipment: Optional[str] = None
+    floor: Optional[str] = None
+
     space_temp: Optional[str] = None
     space_temp_sp: Optional[str] = None
     flow: Optional[str] = None
@@ -143,6 +137,41 @@ class ZonePairResponse(BaseModel):
     reheat: Optional[str] = None
     fan_cmd: Optional[str] = None
     fan_status: Optional[str] = None
+
+    cooling_valve: Optional[str] = None
+    heating_valve: Optional[str] = None
+    compressor_cmd: Optional[str] = None
+    compressor_status: Optional[str] = None
+
+    # Human friendly names from n:displayName
+    space_temp_name: Optional[str] = None
+    space_temp_sp_name: Optional[str] = None
+    flow_name: Optional[str] = None
+    flow_sp_name: Optional[str] = None
+    damper_name: Optional[str] = None
+    reheat_name: Optional[str] = None
+    fan_cmd_name: Optional[str] = None
+    fan_status_name: Optional[str] = None
+    cooling_valve_name: Optional[str] = None
+    heating_valve_name: Optional[str] = None
+    compressor_cmd_name: Optional[str] = None
+    compressor_status_name: Optional[str] = None
+
+
+class ZoneIndexEntry(BaseModel):
+    station: str
+    zone_root: str
+    equipment: Optional[str] = None
+    floor: Optional[str] = None
+
+    has_space_temp: bool = False
+    has_space_temp_sp: bool = False
+    has_flow: bool = False
+    has_flow_sp: bool = False
+    has_damper: bool = False
+    has_reheat: bool = False
+    has_fan_cmd: bool = False
+    has_fan_status: bool = False
 
 
 class ZoneHealthMetricsModel(BaseModel):
@@ -258,24 +287,62 @@ def debug_recent_memory(
     ]
 
 
+@app.get("/debug/series_meta")
+def debug_series_meta(
+    station: Optional[str] = Query(None, description="Optional station filter"),
+    limit: int = Query(500, ge=1, le=5000),
+) -> Dict[str, Any]:
+    """
+    Inspect the effective series metadata that zone_pairs / zone_index see.
+
+    This uses sqlite_store.list_series(), which:
+      - scans distinct (station, history_id) from history_samples, and
+      - overlays any in-memory metadata (equipment, floor, point_name, unit, tags)
+        accumulated from MQTT / imports.
+
+    NOTE: Because sqlite_store._init_schema() drops history_samples on init,
+    this is an edge cache: a fresh process starts with an empty list until
+    new history or imports arrive.
+    """
+    # Get combined series + metadata from the store
+    series = sqlite_store.list_series(limit=limit)
+
+    if station:
+        series = [s for s in series if s.get("station") == station]
+
+    return {
+        "count": len(series),
+        "rows": series,
+    }
+
+
+
 @app.get("/debug/zone_pairs", response_model=List[ZonePairResponse])
 def debug_zone_pairs(
     station: Optional[str] = Query(None),
     zone: Optional[str] = Query(None, description="Zone root filter (canonical)"),
 ) -> List[ZonePairResponse]:
+    """
+    Flatten the nested zone_pairs index into a simple list of ZonePairResponse,
+    but keep equipment/floor and all roles visible.
+    """
     pairs_by_station = zone_pairs_as_dicts()
     results: List[ZonePairResponse] = []
 
     for st_name, zones in pairs_by_station.items():
         if station is not None and st_name != station:
             continue
+
         for zone_root, info in zones.items():
             if zone is not None and zone_root != zone:
                 continue
+
             results.append(
                 ZonePairResponse(
                     station=st_name,
                     zone_root=zone_root,
+                    equipment=info.get("equipment"),
+                    floor=info.get("floor"),
                     space_temp=info.get("space_temp"),
                     space_temp_sp=info.get("space_temp_sp"),
                     flow=info.get("flow"),
@@ -284,6 +351,22 @@ def debug_zone_pairs(
                     reheat=info.get("reheat"),
                     fan_cmd=info.get("fan_cmd"),
                     fan_status=info.get("fan_status"),
+                    cooling_valve=info.get("cooling_valve"),
+                    heating_valve=info.get("heating_valve"),
+                    compressor_cmd=info.get("compressor_cmd"),
+                    compressor_status=info.get("compressor_status"),
+                    space_temp_name=info.get("space_temp_name"),
+                    space_temp_sp_name=info.get("space_temp_sp_name"),
+                    flow_name=info.get("flow_name"),
+                    flow_sp_name=info.get("flow_sp_name"),
+                    damper_name=info.get("damper_name"),
+                    reheat_name=info.get("reheat_name"),
+                    fan_cmd_name=info.get("fan_cmd_name"),
+                    fan_status_name=info.get("fan_status_name"),
+                    cooling_valve_name=info.get("cooling_valve_name"),
+                    heating_valve_name=info.get("heating_valve_name"),
+                    compressor_cmd_name=info.get("compressor_cmd_name"),
+                    compressor_status_name=info.get("compressor_status_name"),
                 )
             )
 
@@ -414,6 +497,48 @@ def debug_flow_tracking(
 # ---- Summary endpoints -----------------------------------------------------
 
 
+@app.get("/summary/zone_index", response_model=List[ZoneIndexEntry])
+def summary_zone_index(
+    station: str = Query(..., description="Niagara station name"),
+) -> List[ZoneIndexEntry]:
+    """
+    List all discovered zones for a station, using the equipment-based
+    topology (zone_root is the canonical form of 'equipment').
+
+    This is the primary index you and the UI/LLM should use to discover
+    valid zone_root values to plug into /summary/zone_health,
+    /summary/building_health, etc.
+    """
+    pairs_by_station = zone_pairs_as_dicts()
+    zones = pairs_by_station.get(station)
+    if not zones:
+        raise HTTPException(status_code=404, detail="No zones found for station.")
+
+    results: List[ZoneIndexEntry] = []
+
+    for zone_root, info in zones.items():
+        results.append(
+            ZoneIndexEntry(
+                station=station,
+                zone_root=zone_root,
+                equipment=info.get("equipment"),
+                floor=info.get("floor"),
+                has_space_temp=info.get("space_temp") is not None,
+                has_space_temp_sp=info.get("space_temp_sp") is not None,
+                has_flow=info.get("flow") is not None,
+                has_flow_sp=info.get("flow_sp") is not None,
+                has_damper=info.get("damper") is not None,
+                has_reheat=info.get("reheat") is not None,
+                has_fan_cmd=info.get("fan_cmd") is not None,
+                has_fan_status=info.get("fan_status") is not None,
+            )
+        )
+
+    # Sort by equipment name if present, else by zone_root
+    results.sort(key=lambda z: (z.equipment or z.zone_root))
+    return results
+
+
 @app.get("/summary/zone_health", response_model=ZoneHealthMetricsModel)
 def summary_zone_health(
     station: str = Query(...),
@@ -477,6 +602,49 @@ def summary_building_health(
 
     results.sort(key=sort_key)
     return results
+
+
+@app.get("/summary/rtu_health")
+def summary_rtu_health(
+    station: str = Query(...),
+    zone: str = Query(..., description="Zone root / equipment key (canonical)"),
+    hours: int = Query(24, ge=1, le=168),
+) -> Dict[str, Any]:
+    """
+    High-level RTU/AHU health metrics based on the same zone_pairs index.
+
+    This is intended for equipment-level analytics like:
+      - fan short-cycling / ON%
+      - compressor/cooling short-cycling
+      - discharge air tracking (once those roles are wired)
+    """
+    pairs_by_station = zone_pairs_as_dicts()
+    zone_info = find_zone_pair(pairs_by_station, station, zone)
+    if zone_info is None:
+        raise HTTPException(status_code=404, detail="Zone/equipment not found for station.")
+
+    end = datetime.utcnow()
+    start = end - timedelta(hours=hours)
+
+    try:
+        metrics = compute_rtu_health(
+            station=station,
+            zone_root=zone,
+            zone_info=zone_info,
+            start=start,
+            end=end,
+        )
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        print("[error] summary_rtu_health failed:\n", tb)  # noqa: T201
+        raise HTTPException(status_code=500, detail=f"RTU health error: {e}")
+
+    payload = rtu_health_to_dict(metrics)
+    payload.setdefault("station", station)
+    payload.setdefault("zone_root", zone)
+    payload.setdefault("equipment", zone_info.get("equipment"))
+    payload.setdefault("hours", hours)
+    return payload
 
 
 # ---- Haystack test endpoints ----------------------------------------------

@@ -1,0 +1,206 @@
+{
+  "rules": [
+    {
+      "role": "space_temp",
+      "priority": 10,
+      "name_regex": [
+        "space\\s*temp",
+        "zone\\s*temp",
+        "\\bzn\\s*t\\b",
+        "room\\s*temp",
+        "effective\\s*space\\s*temp",
+        "discharge\\s*air\\s*temp",
+        "mixed\\s*air\\s*temp",
+        "return\\s*air\\s*temp",
+        "supply\\s*air\\s*temp"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "space_temp",
+      "priority": 5,
+      "name_regex": [],
+      "tags_all": ["zone", "temp"],
+      "tags_any": []
+    },
+    {
+      "role": "space_temp_sp",
+      "priority": 10,
+      "name_regex": [
+        "effective\\s*setpoint",
+        "space\\s*temp\\s*sp",
+        "zone\\s*setpoint",
+        "\\bzn\\s*sp\\b",
+        "supply\\s*air\\s*temp\\s*sp",
+        "rat\\s*sp",
+        "mat\\s*sp"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "flow",
+      "priority": 10,
+      "name_regex": [
+        "box\\s*flow",
+        "air\\s*flow",
+        "airflow",
+        "\\bcfm\\b(?!\\s*sp)",
+        "supply\\s*cfm",
+        "return\\s*cfm",
+        "exhaust\\s*cfm"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "flow_sp",
+      "priority": 10,
+      "name_regex": [
+        "flow\\s*setpoint",
+        "\\bcfm\\s*sp\\b",
+        "airflow\\s*sp",
+        "min\\s*cfm",
+        "max\\s*cfm"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "damper",
+      "priority": 10,
+      "name_regex": [
+        "damper\\s*position",
+        "damper\\s*output",
+        "damper\\s*cmd",
+        "\\bdamper\\b",
+        "oa\\s*damper",
+        "ra\\s*damper",
+        "ea\\s*damper"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "reheat",
+      "priority": 10,
+      "name_regex": [
+        "\\breheat\\b",
+        "rh\\s*valve",
+        "heating\\s*valve",
+        "hot\\s*water\\s*valve",
+        "boiler\\s*valve"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "fan_cmd",
+      "priority": 10,
+      "name_regex": [
+        "fan\\s*command",
+        "fan\\s*cmd",
+        "fan\\s*enable",
+        "fan\\s*enable\\s*output",
+        "\\bfan\\s*ss\\b",
+        "exhaust\\s*fan\\s*cmd",
+        "supply\\s*fan\\s*cmd",
+        "return\\s*fan\\s*cmd"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "fan_status",
+      "priority": 10,
+      "name_regex": [
+        "fan\\s*status",
+        "fan\\s*proof",
+        "supply\\s*fan\\s*status",
+        "return\\s*fan\\s*status",
+        "exhaust\\s*fan\\s*status"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "cooling_valve",
+      "priority": 10,
+      "name_regex": [
+        "cooling\\s*valve",
+        "chilled\\s*water\\s*valve",
+        "cw\\s*valve"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "heating_valve",
+      "priority": 10,
+      "name_regex": ["heating\\s*valve", "hw\\s*valve", "boiler\\s*valve"],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "compressor_cmd",
+      "priority": 10,
+      "name_regex": ["compressor\\s*\\d*\\s*cmd", "stage\\s*\\d*\\s*cmd"],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "compressor_status",
+      "priority": 10,
+      "name_regex": ["compressor\\s*\\d*\\s*status", "stage\\s*\\d*\\s*status"],
+      "tags_all": [],
+      "tags_any": []
+    },
+
+    {
+      "role": "fan_cmd",
+      "priority": 8,
+      "name_regex": ["supply\\s*fan\\s*speed"],
+      "tags_all": [],
+      "tags_any": []
+    }
+    {
+      "role": "compressor_cmd",
+      "priority": 10,
+      "name_regex": [
+        "(?i)compress(or)?\\s*(1|stage\\s*1)?\\s*(cmd|command|output)",
+        "(?i)cool\\s*(1|stage\\s*1)?\\s*(cmd|command|output)"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "compressor_cmd",
+      "priority": 9,
+      "name_regex": [
+        "(?i)(comp|cool)\\s*stg\\s*1",
+        "(?i)(comp|cool)\\s*stage\\s*1"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    },
+    {
+      "role": "compressor_status",
+      "priority": 8,
+      "name_regex": [
+        "(?i)compress(or)?\\s*(1|stage\\s*1)?\\s*status",
+        "(?i)cool\\s*(1|stage\\s*1)?\\s*status",
+        "(?i)compress(or)?\\s*(1|stage\\s*1)?\\s*proof",
+        "(?i)cool\\s*(1|stage\\s*1)?\\s*proof"
+      ],
+      "tags_all": [],
+      "tags_any": []
+    }
+  ]
+}

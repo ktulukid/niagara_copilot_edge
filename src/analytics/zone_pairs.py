@@ -1,259 +1,220 @@
 # src/analytics/zone_pairs.py
-
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
 from ..store import sqlite_store
+from ..niagara_client.mqtt_history_ingest import niagara_canonical_name
+from .role_rules import infer_role
 
-# ---------------------------------------------------------------------------
-# ZONE ROOT DETECTION
-# ---------------------------------------------------------------------------
-# We now support the following equipment root types:
-#   VAV, FPB, RTU, AHU, FCU, EF/EFU, Boiler, Chiller
-#
-# Example valid matches:
-#   "RTU 1", "Ahu-2", "FCU_03", "EF 3-01", "Chiller 1", "Boiler-2"
-#   "VAV 1-13", "Fpb 3-01"
-#
-# Each must be followed by at least one number. A second number (for "-01")
-# is optional, because many equipment (RTU, AHU) don't have a dash index.
-# ---------------------------------------------------------------------------
-
-ZONE_RE = re.compile(
-    r"((?:vav|fpb|rtu|ahu|fcu|ef|efu|boiler|chiller)[\s_-]*\d+(?:[\s_-]*\d+)?)",
-    re.IGNORECASE,
-)
-
-# ---------------------------------------------------------------------------
-# ROLE DETECTION
-# ---------------------------------------------------------------------------
-ROLE_PATTERNS = {
-    # ---------------------------
-    # Temperature + Setpoint
-    # ---------------------------
-    "space_temp": [
-        r"space\s*temp",
-        r"zone\s*temp",
-        r"\bzn\s*t\b",
-        r"room\s*temp",
-        r"effective\s*space\s*temp",
-        r"discharge\s*air\s*temp",          # for RTUs, AHUs, FCUs
-        r"mixed\s*air\s*temp",
-        r"return\s*air\s*temp",
-        r"supply\s*air\s*temp",
-    ],
-    "space_temp_sp": [
-        r"effective\s*setpoint",
-        r"space\s*temp\s*sp",
-        r"zone\s*setpoint",
-        r"\bzn\s*sp\b",
-        r"supply\s*air\s*temp\s*sp",
-        r"rat\s*sp",                        # return air temp sp
-        r"mat\s*sp",                        # mixed air temp sp
-    ],
-
-    # ---------------------------
-    # Flow + Setpoint
-    # ---------------------------
-    "flow": [
-        r"box\s*flow",
-        r"air\s*flow",
-        r"airflow",
-        r"\bcfm\b(?!\s*sp)",
-        r"supply\s*cfm",
-        r"return\s*cfm",
-        r"exhaust\s*cfm",
-    ],
-    "flow_sp": [
-        r"flow\s*setpoint",
-        r"\bcfm\s*sp\b",
-        r"airflow\s*sp",
-        r"min\s*cfm",
-        r"max\s*cfm",
-    ],
-
-    # ---------------------------
-    # Damper
-    # ---------------------------
-    "damper": [
-        r"damper\s*position",
-        r"damper\s*output",
-        r"damper\s*cmd",
-        r"\bdamper\b",
-        r"oa\s*damper",   # AHU outside air damper
-        r"ra\s*damper",   # return air damper
-        r"ea\s*damper",   # exhaust
-    ],
-
-    # ---------------------------
-    # Heating valve / Reheat
-    # ---------------------------
-    "reheat": [
-        r"\breheat\b",
-        r"rh\s*valve",
-        r"heating\s*valve",
-        r"hot\s*water\s*valve",
-        r"boiler\s*valve",
-    ],
-
-    # ---------------------------
-    # Fan Command / Status
-    # ---------------------------
-    "fan_cmd": [
-        r"fan\s*command",
-        r"fan\s*cmd",
-        r"fan\s*enable",
-        r"fan\s*enable\s*output",
-        r"\bfan\s*ss\b",
-        r"exhaust\s*fan\s*cmd",
-        r"supply\s*fan\s*cmd",
-        r"return\s*fan\s*cmd",
-    ],
-    "fan_status": [
-        r"fan\s*status",
-        r"fan\s*proof",
-        r"supply\s*fan\s*status",
-        r"return\s*fan\s*status",
-        r"exhaust\s*fan\s*status",
-    ],
-
-    # ---------------------------
-    # Cooling / Chiller control
-    # ---------------------------
-    "cooling_valve": [
-        r"cooling\s*valve",
-        r"chilled\s*water\s*valve",
-        r"cw\s*valve",
-    ],
-
-    # ---------------------------
-    # Heating / Boiler
-    # ---------------------------
-    "heating_valve": [
-        r"heating\s*valve",
-        r"hw\s*valve",
-        r"boiler\s*valve",
-    ],
-
-    # ---------------------------
-    # Compressors / Stages (RTU, Chiller)
-    # ---------------------------
-    "compressor_cmd": [
-        r"compressor\s*\d*\s*cmd",
-        r"stage\s*\d*\s*cmd",
-    ],
-    "compressor_status": [
-        r"compressor\s*\d*\s*status",
-        r"stage\s*\d*\s*status",
-    ],
-}
 
 # ---------------------------------------------------------------------------
 # DATACLASS: Equipment / Zone Pair
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ZonePair:
-    station_key: str
-    station_name: str
-    zone_root: str  # e.g. "vav-1-01", "rtu-1", "ef-3-01"
+    station: str
+    zone_root: str  # canonicalised equipment name
+    equipment: Optional[str] = None
+    floor: Optional[str] = None
 
-    # Core analytics fields
+    # History IDs for each analytic role
     space_temp: Optional[str] = None
     space_temp_sp: Optional[str] = None
     flow: Optional[str] = None
     flow_sp: Optional[str] = None
     damper: Optional[str] = None
     reheat: Optional[str] = None
-
-    # Fan command + status
     fan_cmd: Optional[str] = None
     fan_status: Optional[str] = None
 
-    # RTU / AHU / Chiller / Boiler signals
     cooling_valve: Optional[str] = None
     heating_valve: Optional[str] = None
     compressor_cmd: Optional[str] = None
     compressor_status: Optional[str] = None
 
+    # Human-friendly labels (from n:displayName)
+    space_temp_name: Optional[str] = None
+    space_temp_sp_name: Optional[str] = None
+    flow_name: Optional[str] = None
+    flow_sp_name: Optional[str] = None
+    damper_name: Optional[str] = None
+    reheat_name: Optional[str] = None
+    fan_cmd_name: Optional[str] = None
+    fan_status_name: Optional[str] = None
+    cooling_valve_name: Optional[str] = None
+    heating_valve_name: Optional[str] = None
+    compressor_cmd_name: Optional[str] = None
+    compressor_status_name: Optional[str] = None
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
-def _infer_zone_root(label: str) -> Optional[str]:
-    if not label:
-        return None
-    s = label.lower()
-    m = ZONE_RE.search(s)
-    if not m:
-        return None
-
-    root = m.group(1)
-    root = root.replace("_", "-").replace(" ", "-")
-    root = re.sub(r"-{2,}", "-", root)
-    return root.strip("-")
-
-
-def _infer_role(label: str) -> Optional[str]:
-    if not label:
-        return None
-
-    s = label.lower()
-    for role, patterns in ROLE_PATTERNS.items():
-        for pat in patterns:
-            if re.search(pat, s):
-                return role
-    return None
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# MAIN INDEX BUILD
+# Helpers
 # ---------------------------------------------------------------------------
 
-def build_zone_pair_index(limit: int = 5000) -> Dict[Tuple[str, str], ZonePair]:
+
+def _canonical_zone_root_from_equipment(equipment: str) -> str:
+    """
+    Convert a Niagara equipment label into a stable zone_root key
+    using the same canonicalisation as MQTT history samples.
+    """
+    return niagara_canonical_name(equipment)
+
+
+def _ensure_zone(
+    index: Dict[str, Dict[str, ZonePair]],
+    station: str,
+    equipment: str,
+    floor: Optional[str],
+) -> ZonePair:
+    """
+    Get or create the ZonePair for (station, equipment).
+    """
+    zones_for_station = index.setdefault(station, {})
+
+    zone_root = _canonical_zone_root_from_equipment(equipment)
+    zone = zones_for_station.get(zone_root)
+    if zone is None:
+        zone = ZonePair(
+            station=station,
+            zone_root=zone_root,
+            equipment=equipment,
+            floor=floor,
+        )
+        zones_for_station[zone_root] = zone
+    else:
+        # Keep latest non-null floor / equipment if they appear later
+        if zone.equipment is None:
+            zone.equipment = equipment
+        if zone.floor is None and floor is not None:
+            zone.floor = floor
+
+    return zone
+
+
+# Map from role name -> (attr for history_id, attr for display label)
+_ROLE_ATTR_MAP: Dict[str, tuple[str, str]] = {
+    "space_temp": ("space_temp", "space_temp_name"),
+    "space_temp_sp": ("space_temp_sp", "space_temp_sp_name"),
+    "flow": ("flow", "flow_name"),
+    "flow_sp": ("flow_sp", "flow_sp_name"),
+    "damper": ("damper", "damper_name"),
+    "reheat": ("reheat", "reheat_name"),
+    "fan_cmd": ("fan_cmd", "fan_cmd_name"),
+    "fan_status": ("fan_status", "fan_status_name"),
+    "cooling_valve": ("cooling_valve", "cooling_valve_name"),
+    "heating_valve": ("heating_valve", "heating_valve_name"),
+    "compressor_cmd": ("compressor_cmd", "compressor_cmd_name"),
+    "compressor_status": ("compressor_status", "compressor_status_name"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Core: build zone index from series metadata
+# ---------------------------------------------------------------------------
+
+
+def zone_pairs_as_dicts(limit: int = 50_000) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Build a nested index of zones/equipment and their analytic roles from the
+    combined series metadata in sqlite_store.
+
+        {
+          "AmsShop": {
+            "vav1_01": {
+              "station": "AmsShop",
+              "zone_root": "vav1_01",
+              "equipment": "Vav1_01",
+              "floor": "1",
+              "space_temp": "/AmsShop/VAV$201$2d01_SpaceTemperature",
+              "space_temp_name": "SpaceTemperature",
+              "flow_sp": "/AmsShop/VAV$201$2d01_AirflowSetpoint",
+              "flow_sp_name": "AirflowSetpoint",
+              ...
+            },
+            ...
+          },
+          ...
+        }
+
+    This is what /debug/zone_pairs and zone_health use.
+    """
+    # Combined series + metadata from SQLite + in-memory overlay
     series = sqlite_store.list_series(limit=limit)
-    index: Dict[Tuple[str, str], ZonePair] = {}
+
+    index: Dict[str, Dict[str, ZonePair]] = {}
 
     for row in series:
-        station_key = row.get("station_key") or ""
-        station_name = row.get("stationName") or ""
-        history_id = row.get("historyId") or ""
-
-        zone_root = _infer_zone_root(history_id)
-        if not zone_root:
+        station = row.get("station")
+        if not station:
             continue
 
-        role = _infer_role(history_id)
+        equipment = row.get("equipment")
+        if not equipment:
+            # No equipment means we can't attach this point to a zone
+            continue
+
+        history_id: str = row.get("history_id") or ""
+        if not history_id:
+            continue
+
+        point_name: str = row.get("point_name") or history_id
+        floor: Optional[str] = row.get("floor")
+        tags_raw = row.get("tags") or []
+
+        # Infer the analytic role using label + tags
+        role = infer_role(point_name, tags_raw)
         if not role:
+            # This point does not participate in analytics roles
             continue
 
-        key = (station_key, zone_root)
+        # Ensure there's a ZonePair for this (station, equipment)
+        zone = _ensure_zone(index, station=station, equipment=equipment, floor=floor)
 
-        zp = index.get(key)
-        if zp is None:
-            zp = ZonePair(
-                station_key=station_key,
-                station_name=station_name,
-                zone_root=zone_root,
-            )
-            index[key] = zp
+        # Map the role name to ZonePair attributes
+        attrs = _ROLE_ATTR_MAP.get(role)
+        if not attrs:
+            # Unknown role string – ignore without failing
+            continue
 
-        # Fill only the first discovered role
-        if getattr(zp, role) is None:
-            setattr(zp, role, history_id)
+        hist_attr, name_attr = attrs
 
-    return index
+        # First writer wins: don't override if already set
+        if getattr(zone, hist_attr) is None:
+            setattr(zone, hist_attr, history_id)
+            setattr(zone, name_attr, point_name)
+
+    # Convert nested ZonePair objects into plain dicts
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for st_name, zones in index.items():
+        out[st_name] = {}
+        for z_root, zp in zones.items():
+            out[st_name][z_root] = zp.to_dict()
+
+    return out
 
 
-def find_zone_pair(station_key: str, zone_root: str, limit: int = 5000) -> Optional[ZonePair]:
-    index = build_zone_pair_index(limit=limit)
-    return index.get((station_key, zone_root))
+# ---------------------------------------------------------------------------
+# Helper to find a specific zone
+# ---------------------------------------------------------------------------
 
 
-def zone_pairs_as_dicts(limit: int = 5000) -> List[dict]:
-    index = build_zone_pair_index(limit=limit)
-    return [asdict(zp) for zp in index.values()]
+def find_zone_pair(
+    pairs_by_station: Dict[str, Dict[str, Dict[str, Any]]],
+    station: str,
+    zone_root: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Look up a single zone pair dict from the nested index produced by
+    zone_pairs_as_dicts().
+    """
+    zones = pairs_by_station.get(station)
+    if not zones:
+        return None
+    return zones.get(zone_root)

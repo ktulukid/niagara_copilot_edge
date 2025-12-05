@@ -7,14 +7,13 @@ import yaml
 from pydantic import BaseModel
 
 
-# -----------------------------
-# Data Source Types
-# -----------------------------
+# ---------------------------------------
+# Data Source Types (simplified)
+# ---------------------------------------
 
 DataSourceType = Literal[
-    "niagara_csv_export",
-    "mqtt_json_stream",
-    "haystack"            # NEW
+    "mqtt_history",
+    "haystack",
 ]
 
 
@@ -22,55 +21,26 @@ class MqttConfig(BaseModel):
     host: str = "localhost"
     port: int = 1883
     history_topic: str = "niagara/histories"
+    equipment_topic: str = "niagara/equipment"  # NEW
 
-
-class NiagaraCsvExportConfig(BaseModel):
-    host: str                    # e.g. "172.20.40.22"
-    ord_path: str                # e.g. "file:%5EhistoryExports/AmsShop"
-    username: str
-    password_env: str = "NIAGARA_PASSWORD"
-    insecure_tls: bool = True
-
-
-class MqttJsonStreamConfig(BaseModel):
-    host: str
-    port: int = 8883
-    topic: str
+    # Optional auth
     username: Optional[str] = None
     password_env: Optional[str] = None
-    tls: bool = True
-    client_id: Optional[str] = None
-    keepalive: int = 60
-    retention_hours: int = 24
 
-
-# -----------------------------
-# NEW: Haystack Config
-# -----------------------------
 
 class HaystackConfig(BaseModel):
-    uri: str                        # e.g. "http://172.20.40.22/haystack/"
-    username: str                    # Niagara/NHaystack username
+    uri: str
+    username: str
     password_env: str = "NIAGARA_PASSWORD"
-    project: str = "default"         # optional
+    project: str = "default"
 
-
-# -----------------------------
-# Unified Data Source Loader
-# -----------------------------
 
 class DataSourceConfig(BaseModel):
     type: DataSourceType
-    niagara_csv_export: Optional[NiagaraCsvExportConfig] = None
-    mqtt_json_stream: Optional[MqttJsonStreamConfig] = None
 
-    # NEW
+    # mqtt_history uses AppConfig.mqtt
     haystack: Optional[HaystackConfig] = None
 
-
-# -----------------------------
-# Comfort Analytics Config
-# -----------------------------
 
 class ComfortConfig(BaseModel):
     occupied_start: str          # "07:00"
@@ -82,10 +52,6 @@ class ComfortConfig(BaseModel):
     comfort_band_degF: float
 
 
-# -----------------------------
-# Main Application Config
-# -----------------------------
-
 class AppConfig(BaseModel):
     site_name: str
     data_source: DataSourceConfig
@@ -96,17 +62,13 @@ class AppConfig(BaseModel):
     db_path: str = "data/history.sqlite"
     db_retention_hours: int = 24 * 30  # 30 days default
 
-    # NEW: global Haystack defaults at root level (optional)
+    # Optional global Haystack defaults
     haystack: Optional[HaystackConfig] = None
 
 
-# -----------------------------
-# Config Loader
-# -----------------------------
-
 def load_config(path: Path | str = "config/config.yaml") -> AppConfig:
     """
-    Load YAML config, then interactively prompt for MQTT host/port overrides.
+    Load YAML config, then (optionally) prompt for MQTT host/port overrides.
 
     If stdin is not available (e.g. non-interactive run), it will silently
     skip prompts and just use values from config.yaml / defaults.
@@ -117,7 +79,7 @@ def load_config(path: Path | str = "config/config.yaml") -> AppConfig:
 
     cfg = AppConfig.parse_obj(raw)
 
-    # Interactive override of MQTT host/port
+    # Interactive override of MQTT host/port (restored behaviour)
     try:
         default_host = cfg.mqtt.host
         default_port = cfg.mqtt.port
